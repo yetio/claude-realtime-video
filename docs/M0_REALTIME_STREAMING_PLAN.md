@@ -47,7 +47,7 @@ Implication: current architecture is "analyze then view". There is no incrementa
 
 M0 scope should not attempt full low-latency video conferencing. The closest product fit is:
 
-- Feed video in chunks or a live-growing source.
+- Feed video in chunks, a live-growing source, or a network stream such as RTSP.
 - Emit keyframes, transcript segments, and status events incrementally.
 - Let the viewer and agent watch a timeline update while processing continues.
 - Preserve the existing local-first and "user chooses what to send to an LLM" privacy model.
@@ -104,7 +104,26 @@ Let users stream screen/camera/browser video into the local service.
   - Requires browser JS capture UX and a non-stdlib dependency stack if using full WebRTC.
   - More security/permission surface.
 
-### Option D — HLS/DASH Playlist Watcher
+### Option D — RTSP/RTMP Network Stream Watcher
+
+Watch a camera/NVR/live encoder stream such as `rtsp://...` and process sampled frames while the stream continues.
+
+- Backend:
+  - Accept `rtsp://` and, later, `rtmp://` sources as first-class realtime inputs.
+  - Use `ffmpeg`/`ffprobe` to connect to the stream and emit rolling image/audio segments.
+  - Add connection controls: transport selection (`tcp` default for RTSP reliability, optional `udp`), reconnect policy, read timeout, max runtime, and explicit cancellation.
+  - Feed extracted frames into the same event sink used by the live viewer: `stream_started`, `frame_kept`, `frame_dropped`, `stream_reconnect`, `stream_timeout`, `stream_done`, `stream_error`.
+  - Preserve a rolling dedup state so static camera feeds do not flood the model with repeated frames.
+- Pros:
+  - Directly supports security cameras, NVRs, IP cameras, and many local live encoders.
+  - Fits the stated realtime streaming goal better than only progressive file/URL processing.
+  - Can reuse ffmpeg, which is already a project requirement.
+- Cons:
+  - Live streams do not have natural "job done" semantics; cancellation and max runtime must be explicit.
+  - RTSP auth URLs may contain credentials, so logs, manifests, and UI must redact source URLs.
+  - Network jitter/reconnect behavior needs negative tests and clear user-facing errors.
+
+### Option E — HLS/DASH Playlist Watcher
 
 Watch a live or VOD HLS/DASH playlist and process new segments.
 
@@ -120,7 +139,7 @@ Watch a live or VOD HLS/DASH playlist and process new segments.
 
 ## 5. Recommendation
 
-Start with Option A plus the minimum refactor needed for Option B later.
+Start with Option A plus the minimum refactor needed for Options B and D later.
 
 M1 should introduce an internal event contract without changing existing CLI output:
 
@@ -130,7 +149,7 @@ M1 should introduce an internal event contract without changing existing CLI out
 4. Update the web page to render frames/transcript/logs incrementally.
 5. Keep current `viewer.html` final artifact unchanged.
 
-This gives a visible realtime experience quickly while avoiding premature WebRTC complexity. Once the event contract is stable, M2 can make the producer truly segment-based.
+This gives a visible realtime experience quickly while avoiding premature WebRTC complexity. Once the event contract is stable, M2 can make the producer truly segment-based, and M3 can add RTSP as a first-class live source without changing the viewer contract.
 
 ## 6. Milestone Draft
 
@@ -156,7 +175,20 @@ This gives a visible realtime experience quickly while avoiding premature WebRTC
   - Generated multi-scene video split into chunks emits monotonic timestamps.
   - Cross-boundary duplicate frame regression.
 
-### M3 — Live Source Intake
+### M3 — RTSP Live Source Intake
+
+- Deliverables:
+  - `rtsp://` source acceptance in CLI/web UI.
+  - ffmpeg-backed RTSP frame/audio sampler with explicit max runtime and cancellation.
+  - RTSP transport option, defaulting to TCP.
+  - Reconnect/read-timeout behavior with typed stream events.
+  - Source URL redaction for logs, manifests, and UI.
+- Validation:
+  - Local synthetic RTSP test source or documented manual test with an IP camera/NVR.
+  - Static-camera regression proves dedup/backpressure prevents repeated-frame floods.
+  - Negative tests for invalid credentials, unreachable host, timeout, and unsupported codec.
+
+### M4 — Browser/HLS Live Source Intake
 
 - Deliverables:
   - HLS watcher or browser MediaRecorder upload path.
@@ -172,6 +204,7 @@ The realtime module is self-developed work on top of the fork. Before shipping i
 
 - Event schema and API boundary.
 - Security/privacy behavior for local server and uploaded/captured media.
+- RTSP source URL redaction and credential handling.
 - Backpressure/cancellation behavior.
 - Test evidence and manual demo notes.
 
