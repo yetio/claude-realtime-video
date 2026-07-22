@@ -52,6 +52,15 @@ M0 scope should not attempt full low-latency video conferencing. The closest pro
 - Let the viewer and agent watch a timeline update while processing continues.
 - Preserve the existing local-first and "user chooses what to send to an LLM" privacy model.
 
+Architect-approved contract:
+
+- This is realtime analysis/progressive viewing, not low-latency WebRTC media transport.
+- M1 target latency: first progress event within 1 second after job creation; first frame event as soon as the existing extractor keeps a frame; steady event delivery without unbounded memory growth.
+- M1 throughput boundary: local single-job first; multi-job fairness is out of M1 except for bounded queues and explicit cancellation.
+- M1 failure boundary: every job reaches a terminal event (`job_done`, `job_error`, or `job_cancelled`) and cleans temporary runtime state.
+- SSE is only the control/progress/event stream. It must not carry raw image bytes.
+- Frame events carry artifact paths/IDs and metadata only; the browser fetches images through a local safe artifact endpoint.
+
 ## 4. Technical Options
 
 ### Option A — WebSocket/SSE Incremental Job Events
@@ -143,11 +152,13 @@ Start with Option A plus the minimum refactor needed for Options B and D later.
 
 M1 should introduce an internal event contract without changing existing CLI output:
 
-1. Add `core.process(..., event_sink=None)` or a new `process_stream(...)` wrapper.
-2. Emit stable JSON-serializable events from the existing batch path.
-3. Add a local SSE endpoint in `serve.py`.
-4. Update the web page to render frames/transcript/logs incrementally.
-5. Keep current `viewer.html` final artifact unchanged.
+1. Replace the current `crv-web` subprocess/stdout polling path with an in-process `JobEventBus` for web jobs. JSONL IPC remains a fallback option only if in-process execution collides with packaging/runtime constraints.
+2. Add `core.process(..., event_sink=None)` or a new `process_stream(...)` wrapper.
+3. Emit stable JSON-serializable events from the existing batch path.
+4. Add a local SSE endpoint in `serve.py` for event delivery.
+5. Add a safe frame artifact endpoint that serves only files under the job output directory, rejects path traversal, and redacts source URLs.
+6. Update the web page to render frames/transcript/logs incrementally.
+7. Keep current CLI behavior and final `viewer.html` artifact unchanged.
 
 This gives a visible realtime experience quickly while avoiding premature WebRTC complexity. Once the event contract is stable, M2 can make the producer truly segment-based, and M3 can add RTSP as a first-class live source without changing the viewer contract.
 
@@ -156,33 +167,44 @@ This gives a visible realtime experience quickly while avoiding premature WebRTC
 ### M1 — Realtime Event Contract and Live Viewer
 
 - Deliverables:
-  - Typed event schema for job lifecycle, frame events, transcript events, and errors.
+  - In-process `JobEventBus` with bounded per-job queues.
+  - Typed event schema for job lifecycle, frame events, transcript/log events, cancellation, cleanup, and errors.
+  - Monotonic per-job `seq` on every event.
+  - SSE endpoint with replay from `Last-Event-ID` or explicit `since` sequence.
+  - Safe frame artifact endpoint; events include artifact IDs/paths and metadata, never raw image bytes.
+  - Cancel endpoint and cleanup path for output/runtime state.
   - Event sink tests using generated tiny videos.
-  - `crv-web` SSE endpoint.
   - Browser UI that updates keyframes/logs before job completion.
 - Validation:
   - Existing `tests/test_smoke.py` still passes.
-  - New tests assert event order and required fields.
+  - New tests assert event order, required fields, sequence monotonicity, replay behavior, queue bounds, artifact endpoint path safety, cancellation, and terminal cleanup.
   - Manual local run shows frames appearing before `job_done`.
 
 ### M2 — Segment/Window Processing
 
 - Deliverables:
   - Segment runner for local files and progressive downloaded sources.
+  - Source clock model and watermark semantics for out-of-order or late transcript/frame evidence.
   - Cross-segment timestamp and dedup state.
+  - Cross-window dedup TTL so repeated shots eventually become eligible again without flooding.
   - Transcript segment reconciliation strategy.
 - Validation:
   - Generated multi-scene video split into chunks emits monotonic timestamps.
+  - Watermark tests prove late evidence does not corrupt already-emitted timeline state.
   - Cross-boundary duplicate frame regression.
 
 ### M3 — RTSP Live Source Intake
 
 - Deliverables:
   - `rtsp://` source acceptance in CLI/web UI.
-  - ffmpeg-backed RTSP frame/audio sampler with explicit max runtime and cancellation.
+  - Frame-only RTSP first; audio/transcript for RTSP is deferred until frame path is stable.
+  - ffmpeg-backed RTSP frame sampler with explicit max runtime and cancellation.
   - RTSP transport option, defaulting to TCP.
   - Reconnect/read-timeout behavior with typed stream events.
-  - Source URL redaction for logs, manifests, and UI.
+  - Credentials must never appear in process argv, logs, manifests, event payloads, or UI. Prefer passing secrets through a temporary config/input channel rather than embedding them in command strings.
+  - Source URL redaction for logs, manifests, event payloads, and UI.
+  - Resource limits: max runtime, max frames/minute, max retained artifacts, and per-stream queue bounds.
+  - Local fixture plan for RTSP-like testing.
 - Validation:
   - Local synthetic RTSP test source or documented manual test with an IP camera/NVR.
   - Static-camera regression proves dedup/backpressure prevents repeated-frame floods.
@@ -206,12 +228,14 @@ The realtime module is self-developed work on top of the fork. Before shipping i
 - Security/privacy behavior for local server and uploaded/captured media.
 - RTSP source URL redaction and credential handling.
 - Backpressure/cancellation behavior.
+- Event replay, bounded queues, terminal cleanup, and safe artifact serving.
 - Test evidence and manual demo notes.
 
 ## 8. Immediate Next Step
 
 Implement M1 as a narrow, backwards-compatible change:
 
-- Add an event sink interface around existing pipeline milestones.
+- Add an in-process `JobEventBus` around existing pipeline milestones.
 - Keep CLI behavior and output paths stable.
-- Add SSE to web UI only after event tests lock the schema.
+- Add SSE and safe artifact endpoints to web UI only after event tests lock the schema.
+- Do not implement RTSP in M1/M2; keep RTSP in M3 after the event and segment contracts are stable.
