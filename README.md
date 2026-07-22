@@ -2,6 +2,11 @@
 
 [![PyPI](https://img.shields.io/pypi/v/claude-real-video)](https://pypi.org/project/claude-real-video/) [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://pypi.org/project/claude-real-video/) [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE) [![HN front page](https://img.shields.io/badge/Hacker%20News-front%20page-orange)](https://news.ycombinator.com/item?id=48766005)
 
+This fork is evolving `claude-real-video` into **Claude realtime video**: the
+same local-first keyframe/transcript pipeline, plus a live event stream and web
+viewer so an agent or browser can start seeing useful evidence before the full
+video finishes processing.
+
 [![crv 60s demo](docs/crv-demo-poster.jpg)](https://github.com/HUANGCHIHHUNGLeo/claude-real-video/releases/download/v0.7.15/crv-demo-60s.mp4)
 
 60-second real demo — real install, real run, real viewer.
@@ -48,6 +53,10 @@ crv "https://www.youtube.com/watch?v=..."
 Then drop the frames + `MANIFEST.txt` into Claude / ChatGPT / Gemini and ask away.
 
 **No terminal needed** — run `crv-web` and a local page opens (Traditional Chinese / Simplified Chinese / English): paste a YouTube or Reels link or a file path, click Analyze, open the result viewer. Video analysis and output generation run on your machine — the source video never gets uploaded. (If you then paste the extracted frames or transcript into a cloud LLM, that data goes to that provider.)
+
+This fork keeps that privacy model. Realtime events will carry status, logs,
+timestamps and artifact IDs/paths only; raw image bytes stay out of the control
+stream, and the browser fetches frames through local artifact endpoints.
 
 Want to eyeball what the model will see first? Add `--viewer` — it writes a local `viewer.html` (video + keyframe grid + transcript) you can double-click open. No network, no extra installs.
 
@@ -127,6 +136,60 @@ screencast and under-samples a fast-cut reel. `claude-real-video` is smarter:
 
 You feed the model *fewer, more meaningful* frames — cheaper context, better
 understanding.
+
+---
+
+## Realtime streaming roadmap
+
+The original tool is batch-first: analyze a URL or file, then open the finished
+viewer. This fork is adding progressive viewing in narrow, compatible steps.
+Existing CLI output, generated folders and `viewer.html` remain stable while the
+realtime path lands.
+
+### M1 — Live job events and viewer
+
+M1 introduces a typed local event contract around the existing pipeline:
+
+- an in-process `JobEventBus` with bounded per-job queues and monotonic `seq`
+  numbers;
+- lifecycle events such as `job_started`, `source_ready`, `frame_kept`,
+  `frame_dropped`, `job_log`, `transcript_segment`, `job_done`, `job_error`,
+  `job_cancelled` and `job_cleanup`;
+- `core.process(..., event_sink=None)` or an equivalent wrapper, so the batch
+  path can emit events without changing CLI output;
+- Server-Sent Events for browser replay via `Last-Event-ID` or `since`;
+- safe frame artifact serving that only exposes files under the job output
+  directory and rejects path traversal;
+- cancel and cleanup paths so every job reaches a terminal event.
+
+Status: the event bus foundation is in place. The next step is wiring the
+existing core pipeline to emit those events.
+
+### M2 — Segment/window processing
+
+M2 turns the producer into a rolling analyzer for local files and progressive
+downloads:
+
+- source clock and watermark semantics;
+- cross-window timestamp normalization;
+- cross-window dedup with a TTL so repeated shots can return later without
+  flooding the viewer;
+- transcript segment reconciliation.
+
+### M3 — RTSP live source intake
+
+M3 adds first-class `rtsp://` input after the event and segment contracts are
+stable. The first version is frame-only and ffmpeg-backed, with:
+
+- explicit max runtime and cancellation;
+- RTSP transport selection, defaulting to TCP;
+- reconnect/read-timeout events;
+- redaction for credentials, source URLs, argv, logs, manifests, events and UI;
+- resource limits for frames per minute, retained artifacts and queue size;
+- a local RTSP-like fixture or documented manual test path.
+
+RTSP is intentionally not part of M1/M2; it builds on the same event stream and
+viewer contract once those are locked.
 
 ---
 
@@ -314,3 +377,12 @@ One-time founder price **$19** through July 31 — **$29** from August 1:
 ## License
 
 MIT
+
+The original copyright and MIT license are preserved in [LICENSE](LICENSE).
+
+## Acknowledgements
+
+This project is based on
+[HUANGCHIHHUNGLeo/claude-real-video](https://github.com/HUANGCHIHHUNGLeo/claude-real-video).
+Thanks to LeoAido and the original project for the local-first video
+understanding pipeline this realtime fork builds on.
