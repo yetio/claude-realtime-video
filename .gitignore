@@ -11,6 +11,7 @@ crv-out/
 !docs/*.jpg
 .gstack/
 dist*/
+docs/M0_REALTIME_STREAMING_PLAN.md
 
 # benchmark: evidence images are committed, working files are not
 !benchmark/results/**/*.jpg
