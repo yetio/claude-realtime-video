@@ -162,8 +162,9 @@ M1 introduces a typed local event contract around the existing pipeline:
   directory and rejects path traversal;
 - cancel and cleanup paths so every job reaches a terminal event.
 
-Status: the event bus foundation is in place. The next step is wiring the
-existing core pipeline to emit those events.
+Status: the event bus, batch-pipeline event sink, replayable SSE endpoint and
+safe artifact serving are in place. The next step is incremental viewer
+rendering plus cancellation and cleanup controls.
 
 ### M2 — Segment/window processing
 

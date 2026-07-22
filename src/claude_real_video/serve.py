@@ -1,17 +1,24 @@
-"""crv web — local web UI: paste a video URL (YouTube, Instagram, ...) or a file
-path, run the analysis, open the result viewer. Stdlib only, runs 100% locally.
-UI ships in Traditional Chinese, Simplified Chinese and English (toggle, persisted)."""
+"""crv web — local batch viewer with replayable realtime job events.
+
+Paste a video URL (YouTube, Instagram, ...) or a file path, run the analysis,
+then open the result viewer. Stdlib only, runs 100% locally. UI ships in
+Traditional Chinese, Simplified Chinese and English (toggle, persisted)."""
 import http.server
 import json
+import mimetypes
 import os
 import shutil
-import subprocess
 import sys
 import threading
 import time
+from urllib.parse import parse_qs, urlparse
 import webbrowser
 
-JOBS: dict = {}  # id -> {state, log, out_dir, err}
+from .core import make_grids, process
+from .job_events import JOB_ERROR, JOB_LOG, JobEvent, JobEventBus
+from .viewer import write_viewer
+
+JOBS: dict = {}  # id -> {state, log, out_dir, err, bus}
 
 PAGE = """<!doctype html>
 <html lang="zh-Hant"><head><meta charset="utf-8">
@@ -136,25 +143,42 @@ document.getElementById('openv').addEventListener('click', ()=>fetch('/open?id='
 def _run_job(jid: str, src: str, opts: dict) -> None:
     job = JOBS[jid]
     out = job["out_dir"]
-    cmd = [sys.executable, "-m", "claude_real_video", src, "-o", out, "--viewer"]
-    if opts.get("adaptive"):
-        cmd.append("--adaptive")
-    if opts.get("text_anchors"):
-        cmd.append("--text-anchors")
-    if opts.get("grid"):
-        cmd.append("--grid")
-    if not opts.get("transcribe", True):
-        cmd.append("--no-transcribe")
+    bus: JobEventBus = job["bus"]
+
+    def event_sink(event_type: str, data: dict) -> None:
+        bus.emit(jid, event_type, data)
+        if event_type == JOB_LOG:
+            job["log"] += f"{data.get('message', '')}\n"
+
     try:
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
-        for line in p.stdout:
-            job["log"] += line
-        p.wait()
-        job["state"] = "done" if p.returncode == 0 else "error"
-        if p.returncode != 0:
-            job["err"] = f"exit {p.returncode}"
+        result = process(
+            src, out,
+            adaptive=bool(opts.get("adaptive")),
+            text_anchors=bool(opts.get("text_anchors")),
+            do_transcribe=bool(opts.get("transcribe", True)),
+            event_sink=event_sink,
+        )
+        if opts.get("grid"):
+            make_grids(result.frames_dir, out)
+        write_viewer(out, result.video)
+        job["state"] = "done"
     except Exception as e:  # noqa: BLE001 — whatever failed, show it in the UI
         job["state"], job["err"] = "error", str(e)
+        if not bus.is_terminal(jid):
+            bus.emit(jid, JOB_ERROR, {"error_type": type(e).__name__, "message": str(e)})
+
+
+def _query_value(path: str, key: str) -> str | None:
+    return parse_qs(urlparse(path).query).get(key, [None])[0]
+
+
+def _safe_artifact_path(out_dir: str, artifact: str) -> str | None:
+    """Return an existing file only when it resolves inside this job's output."""
+    root = os.path.realpath(out_dir)
+    candidate = os.path.realpath(os.path.join(root, artifact))
+    if os.path.commonpath((root, candidate)) != root:
+        return None
+    return candidate if os.path.isfile(candidate) else None
 
 
 class _Handler(http.server.BaseHTTPRequestHandler):
@@ -169,6 +193,55 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _events(self, jid: str, since: int) -> None:
+        job = JOBS.get(jid)
+        if job is None:
+            return self._json({"error": "unknown job"}, 404)
+        bus: JobEventBus = job["bus"]
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        try:
+            while True:
+                events = bus.wait_for_events(jid, since=since, timeout=15.0)
+                if events:
+                    for event in events:
+                        self._write_sse_event(event)
+                        since = event.seq
+                    if bus.is_terminal(jid):
+                        return
+                elif bus.is_terminal(jid):
+                    return
+                else:
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
+    def _write_sse_event(self, event: JobEvent) -> None:
+        payload = json.dumps(event.to_dict(), ensure_ascii=False, separators=(",", ":"))
+        message = f"id: {event.seq}\nevent: {event.type}\ndata: {payload}\n\n"
+        self.wfile.write(message.encode("utf-8"))
+        self.wfile.flush()
+
+    def _artifact(self, jid: str, artifact: str | None) -> None:
+        job = JOBS.get(jid)
+        if job is None:
+            return self._json({"error": "unknown job"}, 404)
+        if not artifact:
+            return self._json({"error": "missing artifact path"}, 400)
+        path = _safe_artifact_path(job["out_dir"], artifact)
+        if path is None:
+            return self._json({"error": "artifact not found"}, 404)
+        content_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(os.path.getsize(path)))
+        self.end_headers()
+        with open(path, "rb") as f:
+            shutil.copyfileobj(f, self.wfile)
+
     def do_GET(self):
         if self.path == "/":
             body = PAGE.encode()
@@ -178,12 +251,22 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
         elif self.path.startswith("/status"):
-            jid = self.path.split("id=")[-1]
+            jid = _query_value(self.path, "id")
             j = JOBS.get(jid)
             self._json({"state": j["state"], "log": j["log"][-4000:], "err": j.get("err")}
                        if j else {"state": "error", "err": "unknown job"})
+        elif self.path.startswith("/events"):
+            jid = _query_value(self.path, "id")
+            raw_since = _query_value(self.path, "since") or self.headers.get("Last-Event-ID") or "0"
+            try:
+                since = max(0, int(raw_since))
+            except ValueError:
+                return self._json({"error": "invalid event sequence"}, 400)
+            self._events(jid or "", since)
+        elif self.path.startswith("/artifacts"):
+            self._artifact(_query_value(self.path, "id") or "", _query_value(self.path, "path"))
         elif self.path.startswith("/open"):
-            jid = self.path.split("id=")[-1]
+            jid = _query_value(self.path, "id")
             j = JOBS.get(jid)
             if j:
                 viewer = os.path.join(j["out_dir"], "viewer.html")
@@ -206,7 +289,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             return self._json({"error": "missing src"}, 400)
         jid = str(int(time.time() * 1000))
         out = os.path.join(os.path.expanduser("~/crv-web-out"), jid)
-        JOBS[jid] = {"state": "running", "log": "", "out_dir": out}
+        JOBS[jid] = {"state": "running", "log": "", "out_dir": out, "bus": JobEventBus()}
         threading.Thread(target=_run_job, args=(jid, src, data.get("opts") or {}),
                          daemon=True).start()
         self._json({"id": jid})
