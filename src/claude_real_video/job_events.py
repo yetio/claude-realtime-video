@@ -125,6 +125,16 @@ class JobEventBus:
             self._changed.notify_all()
             return event
 
+    def event_sink(self, job_id: str) -> Callable[[str, dict[str, Any]], None]:
+        """Return the callback shape accepted by ``core.process`` for one job."""
+        if not job_id:
+            raise ValueError("job_id is required")
+
+        def sink(event_type: str, data: dict[str, Any]) -> None:
+            self.emit(job_id, event_type, data)
+
+        return sink
+
     def cancel(self, job_id: str, reason: str = "") -> JobEvent:
         data = {"reason": reason} if reason else {}
         return self.emit(job_id, JOB_CANCELLED, data)

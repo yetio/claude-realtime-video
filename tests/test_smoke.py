@@ -67,6 +67,74 @@ def test_frames_json_end_to_end(tmp_path):
     assert all(f["timestamp"].count(":") == 2 for f in data["frames"])
 
 
+def test_process_emits_batch_events_without_changing_result(tmp_path):
+    """The optional observer gets a complete event lifecycle while the original
+    batch result and artifacts stay exactly as they were."""
+    import shutil as _sh
+
+    if not (_sh.which("ffmpeg") and _sh.which("ffprobe")):
+        import pytest
+        pytest.skip("ffmpeg not installed")
+    src = tmp_path / "src.mp4"
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=duration=2:size=320x240:rate=10",
+         "-pix_fmt", "yuv420p", str(src)], capture_output=True, check=True)
+    from claude_real_video import process
+    from claude_real_video.job_events import JobEventBus
+
+    bus = JobEventBus(clock=lambda: 123.0)
+
+    result = process(
+        str(src), str(tmp_path / "out"), do_transcribe=False,
+        event_sink=bus.event_sink("job-1"),
+    )
+
+    events = bus.replay("job-1")
+    event_types = [event.type for event in events]
+    assert event_types[0] == "job_started"
+    assert "source_ready" in event_types
+    assert "frame_kept" in event_types
+    assert event_types[-1] == "job_done"
+    assert [event.seq for event in events] == list(range(1, len(events) + 1))
+    assert (tmp_path / "out" / "MANIFEST.txt").exists()
+    assert result.frame_count == sum(event_type == "frame_kept" for event_type in event_types)
+
+
+def test_event_sink_failure_does_not_change_batch_result(tmp_path):
+    import shutil as _sh
+
+    if not (_sh.which("ffmpeg") and _sh.which("ffprobe")):
+        import pytest
+        pytest.skip("ffmpeg not installed")
+    src = tmp_path / "src.mp4"
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=duration=1:size=160x120:rate=10",
+         "-pix_fmt", "yuv420p", str(src)], capture_output=True, check=True)
+    from claude_real_video import process
+
+    result = process(
+        str(src), str(tmp_path / "out"), do_transcribe=False,
+        event_sink=lambda _event_type, _data: (_ for _ in ()).throw(RuntimeError("observer failed")),
+    )
+
+    assert result.frame_count >= 1
+
+
+def test_process_emits_job_error_before_reraising(tmp_path):
+    import pytest
+    from claude_real_video import process
+
+    events = []
+    with pytest.raises(FileNotFoundError):
+        process(
+            str(tmp_path / "missing.mp4"), str(tmp_path / "out"), do_transcribe=False,
+            event_sink=lambda event_type, data: events.append((event_type, data)),
+        )
+
+    assert [event_type for event_type, _ in events] == ["job_started", "job_error"]
+    assert events[-1][1]["error_type"] == "FileNotFoundError"
+
+
 def test_manifest_fences_untrusted_transcript(tmp_path):
     """The transcript is the one part of MANIFEST.txt an attacker controls — it is
     whatever the video's subtitles say. Every other line addresses the reader in the

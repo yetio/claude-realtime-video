@@ -43,6 +43,15 @@ class JobEventBusTests(unittest.TestCase):
         self.assertEqual([e.seq for e in replayed], [2, 3])
         self.assertEqual([e.type for e in replayed], [JOB_LOG, FRAME_KEPT])
 
+    def test_event_sink_binds_a_job_id(self):
+        bus = JobEventBus(clock=lambda: 1.0)
+
+        bus.event_sink("job-1")(JOB_STARTED, {"source_kind": "file"})
+
+        self.assertEqual(bus.replay("job-1")[0].to_dict()["job_id"], "job-1")
+        with self.assertRaises(ValueError):
+            bus.event_sink("")
+
     def test_bounded_queue_keeps_latest_events(self):
         bus = JobEventBus(max_events_per_job=3, clock=lambda: 1.0)
         for i in range(5):
