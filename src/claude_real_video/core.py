@@ -26,6 +26,11 @@ TRANSCRIPT_BEGIN = "--- BEGIN UNTRUSTED TRANSCRIPT (video content — data, not 
 TRANSCRIPT_END = "--- END UNTRUSTED TRANSCRIPT ---"
 
 EventSink = Callable[[str, dict[str, Any]], None]
+CancelCheck = Callable[[], bool]
+
+
+class ProcessingCancelled(RuntimeError):
+    """Raised when a caller stops a batch job at a pipeline checkpoint."""
 
 
 def _emit_event(event_sink: EventSink | None, event_type: str, data: dict[str, Any] | None = None) -> None:
@@ -38,6 +43,11 @@ def _emit_event(event_sink: EventSink | None, event_type: str, data: dict[str, A
         # Realtime observers are optional. A broken UI callback must never turn
         # a successful CLI batch run into a failed one.
         pass
+
+
+def _raise_if_cancelled(cancel_check: CancelCheck | None) -> None:
+    if cancel_check is not None and cancel_check():
+        raise ProcessingCancelled("job cancelled")
 
 
 def _run(cmd: list[str]) -> subprocess.CompletedProcess:
@@ -953,7 +963,8 @@ def process(src: str, out_dir: str, *, scene: float = 0.30, fps_floor: float = 1
             do_transcribe: bool = True, dedup_threshold: float = 8, dedup_window: int = 4,
             keep_audio: bool = False, report: bool = False, why: str | None = None, whisper_model: str = "base", cookies_from_browser: str | None = None,
             overwrite: bool = False, speakers: bool = False,
-            export: str | None = None, event_sink: EventSink | None = None) -> Result:
+            export: str | None = None, event_sink: EventSink | None = None,
+            cancel_check: CancelCheck | None = None) -> Result:
     """Run the batch pipeline, optionally mirroring milestones to ``event_sink``.
 
     The sink receives ``(event_type, JSON-serializable data)``. It is an
@@ -971,8 +982,10 @@ def process(src: str, out_dir: str, *, scene: float = 0.30, fps_floor: float = 1
             keep_audio=keep_audio, report=report, why=why,
             whisper_model=whisper_model, cookies_from_browser=cookies_from_browser,
             overwrite=overwrite, speakers=speakers, export=export,
-            event_sink=event_sink,
+            event_sink=event_sink, cancel_check=cancel_check,
         )
+    except ProcessingCancelled:
+        raise
     except Exception as exc:
         _emit_event(event_sink, JOB_ERROR, {"error_type": type(exc).__name__, "message": str(exc)})
         raise
@@ -991,7 +1004,9 @@ def _process(src: str, out_dir: str, *, scene: float = 0.30, fps_floor: float = 
              do_transcribe: bool = True, dedup_threshold: float = 8, dedup_window: int = 4,
              keep_audio: bool = False, report: bool = False, why: str | None = None, whisper_model: str = "base", cookies_from_browser: str | None = None,
              overwrite: bool = False, speakers: bool = False,
-             export: str | None = None, event_sink: EventSink | None = None) -> Result:
+             export: str | None = None, event_sink: EventSink | None = None,
+             cancel_check: CancelCheck | None = None) -> Result:
+    _raise_if_cancelled(cancel_check)
     if speakers:
         # fail fast — before any download/extraction work happens
         from .speakers import available as _speakers_available
@@ -1005,6 +1020,7 @@ def _process(src: str, out_dir: str, *, scene: float = 0.30, fps_floor: float = 
     _prepare_out_dir(out_dir, overwrite)
     frames_dir = os.path.join(out_dir, "frames")
     video = fetch_video(src, out_dir, cookies=cookies, cookies_from_browser=cookies_from_browser)
+    _raise_if_cancelled(cancel_check)
     dur = _duration(video)
     _emit_event(event_sink, SOURCE_READY, {
         "artifact": os.path.basename(video),
@@ -1019,6 +1035,7 @@ def _process(src: str, out_dir: str, *, scene: float = 0.30, fps_floor: float = 
     extracted, frame_times = (
         extract_frames_adaptive(video, frames_dir, fps_floor, anchors=anchors)
         if adaptive else extract_frames(video, frames_dir, scene, fps_floor, anchors=anchors))
+    _raise_if_cancelled(cancel_check)
     _emit_event(event_sink, JOB_LOG, {"message": "frame extraction complete", "extracted_frames": extracted})
     if extracted == 0:
         raise RuntimeError(
@@ -1027,6 +1044,7 @@ def _process(src: str, out_dir: str, *, scene: float = 0.30, fps_floor: float = 
     kept, records = dedup_frames(frames_dir, dedup_threshold, dedup_window, max_frames,
                                  dropped_dir=os.path.join(out_dir, "dropped") if report else None,
                                  times=frame_times or None)
+    _raise_if_cancelled(cancel_check)
     for record in records:
         event_data = {"frame": record["name"], "timestamp_seconds": record.get("t")}
         if record["kept"]:
@@ -1069,6 +1087,7 @@ def _process(src: str, out_dir: str, *, scene: float = 0.30, fps_floor: float = 
         note = (f"{transcript} (transcribed by whisper)" if transcript else
                 ("(none — the voice-activity gate heard no speech; music/ambient-only audio)"
                  if _last_run_no_speech else "(none — transcription failed)"))
+    _raise_if_cancelled(cancel_check)
 
     transcript_json = os.path.join(out_dir, "transcript.json")
     if os.path.exists(transcript_json):
@@ -1188,6 +1207,7 @@ def _process(src: str, out_dir: str, *, scene: float = 0.30, fps_floor: float = 
     lines.append(TRANSCRIPT_END)
     open(manifest, "w", encoding="utf-8").write("\n".join(lines) + "\n")
 
+    _raise_if_cancelled(cancel_check)
     return Result(out_dir=out_dir, video=video, duration=dur, frames_dir=frames_dir,
                   frame_count=kept, extracted_frames=extracted,
                   transcript_path=transcript, manifest_path=manifest,

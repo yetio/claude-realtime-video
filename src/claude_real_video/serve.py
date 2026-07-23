@@ -8,14 +8,15 @@ import json
 import mimetypes
 import os
 import shutil
+import subprocess
 import sys
 import threading
 import time
 from urllib.parse import parse_qs, urlparse
 import webbrowser
 
-from .core import make_grids, process
-from .job_events import JOB_ERROR, JOB_LOG, JobEvent, JobEventBus
+from .core import ProcessingCancelled, make_grids, process
+from .job_events import JOB_DONE, JOB_ERROR, JOB_LOG, JobEvent, JobEventBus
 from .viewer import write_viewer
 
 JOBS: dict = {}  # id -> {state, log, out_dir, err, bus}
@@ -51,6 +52,12 @@ PAGE = """<!doctype html>
   #done { display:none; margin-top:18px }
   #done button { font:inherit; font-size:14.5px; cursor:pointer; color:#0d0b07; background:#7cc36a;
          border:none; border-radius:10px; padding:12px 28px; font-weight:bold }
+  #cancel { display:none; font:inherit; font-size:13px; cursor:pointer; color:#d88373; background:transparent;
+         border:1px solid #744338; border-radius:8px; padding:8px 14px; margin:14px 0 0 }
+  #frames { width:100%; max-width:720px; display:none; margin-top:22px; grid-template-columns:repeat(auto-fill,minmax(140px,1fr)); gap:8px }
+  #frames a { display:block; border:1px solid #2a2418; border-radius:8px; overflow:hidden; background:#14110b; color:#c9bda3; font-size:10px; text-decoration:none }
+  #frames img { display:block; width:100%; aspect-ratio:16/9; object-fit:cover; background:#0d0b07 }
+  #frames span { display:block; padding:4px 6px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
 </style></head><body>
 <div class="lang">
   <button data-lang="zh_tw">繁中</button><button data-lang="zh_cn">简中</button><button data-lang="en">EN</button>
@@ -68,6 +75,8 @@ PAGE = """<!doctype html>
   <button type="submit" id="go"></button>
 </form>
 <div id="log"></div>
+<div id="frames"></div>
+<button id="cancel" type="button" data-i="cancel"></button>
 <div id="done"><button id="openv"></button></div>
 <p style="margin-top:28px;font-size:12px;opacity:.55;text-align:center">Built in public by <a href="https://x.com/LeoAidoAI" target="_blank" style="color:inherit">@LeoAidoAI</a></p>
 <script>
@@ -78,7 +87,7 @@ const I18N = {
     adaptive:"慢變化內容", adaptive_h:"（教學、手寫、慢速運鏡）",
     ta:"字幕感知", ta_h:"（字卡、簡報、螢幕錄影）",
     grid:"九宮格", grid_h:"（省 token）", tr:"逐字稿",
-    go:"開始分析", running:"分析中...", starting:"啟動中...",
+    go:"開始分析", running:"分析中...", starting:"啟動中...", cancel:"取消分析", cancelled:"已取消",
     open:"開啟結果頁", failed:"失敗" },
   zh_cn: { title:"crv 网页版",
     sub:"粘贴 YouTube / Instagram Reels 链接或本机视频路径，AI 就能真的看懂这条视频。全程在你的电脑上跑，不上传任何东西。",
@@ -86,7 +95,7 @@ const I18N = {
     adaptive:"慢变化内容", adaptive_h:"（教学、手写、慢速运镜）",
     ta:"字幕感知", ta_h:"（字卡、演示文稿、屏幕录制）",
     grid:"九宫格", grid_h:"（省 token）", tr:"逐字稿",
-    go:"开始分析", running:"分析中...", starting:"启动中...",
+    go:"开始分析", running:"分析中...", starting:"启动中...", cancel:"取消分析", cancelled:"已取消",
     open:"打开结果页", failed:"失败" },
   en: { title:"crv Web",
     sub:"Paste a YouTube / Instagram Reels link or a local file path — your AI gets to actually watch the video. Runs 100% on your machine, nothing is uploaded.",
@@ -94,7 +103,7 @@ const I18N = {
     adaptive:"Slow-changing", adaptive_h:"(tutorials, handwriting, slow pans)",
     ta:"Text anchors", ta_h:"(captions, slides, screen recordings)",
     grid:"Contact sheets", grid_h:"(saves tokens)", tr:"Transcript",
-    go:"Analyze", running:"Running...", starting:"Starting...",
+    go:"Analyze", running:"Running...", starting:"Starting...", cancel:"Cancel analysis", cancelled:"Cancelled",
     open:"Open results", failed:"Failed" }
 };
 let L = localStorage.getItem('crv_lang') || 'zh_tw';
@@ -113,29 +122,48 @@ document.querySelectorAll('.lang button').forEach(b=>b.addEventListener('click',
 applyLang(L);
 
 const f=document.getElementById('f'), log=document.getElementById('log'),
-      done=document.getElementById('done'), go=document.getElementById('go');
-let jid=null, timer=null;
+      done=document.getElementById('done'), go=document.getElementById('go'),
+      frames=document.getElementById('frames'), cancel=document.getElementById('cancel');
+let jid=null, stream=null;
+function endRun(message, isDone){
+  if(stream){ stream.close(); stream=null; }
+  go.disabled=false; go.textContent=T.go; cancel.style.display='none';
+  if(isDone) done.style.display='block';
+  if(message){ log.textContent += '\\n' + message; log.scrollTop=log.scrollHeight; }
+}
+function addFrame(data){
+  const path=data.artifact;
+  if(!path) return;
+  const a=document.createElement('a'), img=document.createElement('img'), label=document.createElement('span');
+  const url='/artifacts?id='+encodeURIComponent(jid)+'&path='+encodeURIComponent(path);
+  a.href=url; a.target='_blank'; img.src=url; img.alt=data.frame||path;
+  label.textContent=(data.frame||path)+(data.timestamp_seconds==null?'':' · '+data.timestamp_seconds.toFixed(2)+'s');
+  a.append(img,label); frames.append(a); frames.style.display='grid';
+}
+function connectEvents(){
+  stream=new EventSource('/events?id='+encodeURIComponent(jid));
+  stream.addEventListener('job_log', e=>{ const d=JSON.parse(e.data).data; if(d.message){ log.textContent += '\\n'+d.message; log.scrollTop=log.scrollHeight; } });
+  stream.addEventListener('frame_kept', e=>addFrame(JSON.parse(e.data).data));
+  stream.addEventListener('job_done', ()=>endRun('', true));
+  stream.addEventListener('job_cancelled', ()=>endRun(T.cancelled, false));
+  stream.addEventListener('job_error', e=>{ const d=JSON.parse(e.data).data; endRun(T.failed+': '+(d.message||''), false); });
+}
 f.addEventListener('submit', async e=>{
   e.preventDefault();
   const src=document.getElementById('src').value.trim();
   if(!src) return;
-  go.disabled=true; go.textContent=T.running; done.style.display='none';
+  go.disabled=true; go.textContent=T.running; done.style.display='none'; cancel.style.display='inline-block';
   log.style.display='block'; log.textContent=T.starting;
+  frames.replaceChildren(); frames.style.display='none';
   const opts={adaptive:adaptive.checked, text_anchors:text_anchors.checked,
               grid:grid.checked, transcribe:transcribe.checked};
   const r=await fetch('/run',{method:'POST',headers:{'Content-Type':'application/json'},
               body:JSON.stringify({src, opts})});
-  jid=(await r.json()).id;
-  timer=setInterval(poll, 1200);
+  const payload=await r.json();
+  if(!r.ok){ endRun(T.failed+': '+(payload.error||''), false); return; }
+  jid=payload.id; connectEvents();
 });
-async function poll(){
-  const s=await (await fetch('/status?id='+jid)).json();
-  log.textContent=s.log||'...'; log.scrollTop=log.scrollHeight;
-  if(s.state==='done'){ clearInterval(timer); go.disabled=false; go.textContent=T.go;
-    done.style.display='block'; }
-  if(s.state==='error'){ clearInterval(timer); go.disabled=false; go.textContent=T.go;
-    log.textContent+='\\n\\n'+T.failed+': '+(s.err||''); }
-}
+cancel.addEventListener('click', async ()=>{ if(jid) await fetch('/cancel?id='+encodeURIComponent(jid),{method:'POST'}); });
 document.getElementById('openv').addEventListener('click', ()=>fetch('/open?id='+jid));
 </script></body></html>"""
 
@@ -146,6 +174,11 @@ def _run_job(jid: str, src: str, opts: dict) -> None:
     bus: JobEventBus = job["bus"]
 
     def event_sink(event_type: str, data: dict) -> None:
+        # core finishes its batch artifacts before the web-only viewer/grid
+        # artifacts. Hold job_done until those web artifacts are ready too.
+        if event_type == JOB_DONE:
+            job["done_event"] = dict(data)
+            return
         bus.emit(jid, event_type, data)
         if event_type == JOB_LOG:
             job["log"] += f"{data.get('message', '')}\n"
@@ -157,15 +190,28 @@ def _run_job(jid: str, src: str, opts: dict) -> None:
             text_anchors=bool(opts.get("text_anchors")),
             do_transcribe=bool(opts.get("transcribe", True)),
             event_sink=event_sink,
+            cancel_check=job["cancel_event"].is_set,
         )
+        if job["cancel_event"].is_set():
+            job["state"] = "cancelled"
+            return
         if opts.get("grid"):
             make_grids(result.frames_dir, out)
         write_viewer(out, result.video)
         job["state"] = "done"
+        done_event = job.pop("done_event", None)
+        if done_event is None:
+            done_event = {"frame_count": result.frame_count}
+        bus.emit(jid, JOB_DONE, done_event)
+    except ProcessingCancelled:
+        job["state"] = "cancelled"
     except Exception as e:  # noqa: BLE001 — whatever failed, show it in the UI
         job["state"], job["err"] = "error", str(e)
         if not bus.is_terminal(jid):
             bus.emit(jid, JOB_ERROR, {"error_type": type(e).__name__, "message": str(e)})
+    finally:
+        if bus.is_terminal(jid) and not bus.has_cleanup(jid):
+            bus.cleanup(jid, "worker finished")
 
 
 def _query_value(path: str, key: str) -> str | None:
@@ -280,6 +326,16 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
+        if self.path.startswith("/cancel"):
+            jid = _query_value(self.path, "id") or ""
+            job = JOBS.get(jid)
+            if job is None:
+                return self._json({"error": "unknown job"}, 404)
+            if not job["bus"].is_terminal(jid):
+                job["cancel_event"].set()
+                job["bus"].cancel(jid, "user requested")
+                job["state"] = "cancelling"
+            return self._json({"state": job["state"]})
         if self.path != "/run":
             return self.send_error(404)
         n = int(self.headers.get("Content-Length", 0))
@@ -289,7 +345,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             return self._json({"error": "missing src"}, 400)
         jid = str(int(time.time() * 1000))
         out = os.path.join(os.path.expanduser("~/crv-web-out"), jid)
-        JOBS[jid] = {"state": "running", "log": "", "out_dir": out, "bus": JobEventBus()}
+        JOBS[jid] = {
+            "state": "running", "log": "", "out_dir": out,
+            "bus": JobEventBus(), "cancel_event": threading.Event(),
+        }
         threading.Thread(target=_run_job, args=(jid, src, data.get("opts") or {}),
                          daemon=True).start()
         self._json({"id": jid})

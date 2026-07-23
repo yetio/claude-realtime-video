@@ -135,6 +135,18 @@ def test_process_emits_job_error_before_reraising(tmp_path):
     assert events[-1][1]["error_type"] == "FileNotFoundError"
 
 
+def test_process_honors_cancellation_before_work(tmp_path):
+    import pytest
+    from claude_real_video import process
+    from claude_real_video.core import ProcessingCancelled
+
+    with pytest.raises(ProcessingCancelled):
+        process(
+            str(tmp_path / "input.mp4"), str(tmp_path / "out"),
+            do_transcribe=False, cancel_check=lambda: True,
+        )
+
+
 def test_manifest_fences_untrusted_transcript(tmp_path):
     """The transcript is the one part of MANIFEST.txt an attacker controls — it is
     whatever the video's subtitles say. Every other line addresses the reader in the

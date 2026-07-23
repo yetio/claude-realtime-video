@@ -8,7 +8,16 @@ import threading
 from types import SimpleNamespace
 
 from claude_real_video import serve
-from claude_real_video.job_events import JOB_DONE, JOB_LOG, JOB_STARTED, SOURCE_READY, JobEventBus
+from claude_real_video.job_events import (
+    JOB_CANCELLED,
+    JOB_CLEANUP,
+    JOB_DONE,
+    FRAME_KEPT,
+    JOB_LOG,
+    JOB_STARTED,
+    SOURCE_READY,
+    JobEventBus,
+)
 
 
 def _server():
@@ -27,10 +36,20 @@ def _get(server, path, headers=None):
     return response.status, dict(response.getheaders()), body
 
 
+def _post(server, path):
+    conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+    conn.request("POST", path)
+    response = conn.getresponse()
+    body = response.read()
+    conn.close()
+    return response.status, json.loads(body)
+
+
 def test_sse_replays_from_since_and_last_event_id(tmp_path):
     jid = "events-job"
     bus = JobEventBus(clock=lambda: 123.0)
-    serve.JOBS[jid] = {"state": "done", "log": "", "out_dir": str(tmp_path), "bus": bus}
+    serve.JOBS[jid] = {"state": "done", "log": "", "out_dir": str(tmp_path), "bus": bus,
+                        "cancel_event": threading.Event()}
     bus.emit(jid, JOB_STARTED, {"source_kind": "file"})
     bus.emit(jid, SOURCE_READY, {"artifact": "source.mp4"})
     bus.emit(jid, JOB_DONE, {"frame_count": 1})
@@ -61,7 +80,8 @@ def test_artifact_endpoint_stays_inside_job_output(tmp_path):
     image.write_bytes(b"jpeg-bytes")
     secret = tmp_path.parent / "secret.txt"
     secret.write_text("not for this job", encoding="utf-8")
-    serve.JOBS[jid] = {"state": "done", "log": "", "out_dir": str(tmp_path), "bus": JobEventBus()}
+    serve.JOBS[jid] = {"state": "done", "log": "", "out_dir": str(tmp_path), "bus": JobEventBus(),
+                        "cancel_event": threading.Event()}
     server, _thread = _server()
     try:
         status, headers, body = _get(server, f"/artifacts?id={jid}&path=frames/frame_001.jpg")
@@ -81,11 +101,13 @@ def test_artifact_endpoint_stays_inside_job_output(tmp_path):
 def test_web_runner_routes_core_events_to_its_job_bus(tmp_path, monkeypatch):
     jid = "run-job"
     bus = JobEventBus(clock=lambda: 123.0)
-    serve.JOBS[jid] = {"state": "running", "log": "", "out_dir": str(tmp_path), "bus": bus}
+    serve.JOBS[jid] = {"state": "running", "log": "", "out_dir": str(tmp_path), "bus": bus,
+                        "cancel_event": threading.Event()}
 
     def fake_process(_src, out_dir, *, event_sink, **_kwargs):
         event_sink(JOB_STARTED, {"source_kind": "file"})
         event_sink(JOB_LOG, {"message": "extracting"})
+        event_sink(FRAME_KEPT, {"artifact": "frames/frame_001.jpg"})
         event_sink(JOB_DONE, {"frame_count": 1})
         return SimpleNamespace(frames_dir=out_dir + "/frames", video=out_dir + "/source.mp4")
 
@@ -95,5 +117,46 @@ def test_web_runner_routes_core_events_to_its_job_bus(tmp_path, monkeypatch):
 
     assert serve.JOBS[jid]["state"] == "done"
     assert "extracting" in serve.JOBS[jid]["log"]
-    assert [event.type for event in bus.replay(jid)] == [JOB_STARTED, JOB_LOG, JOB_DONE]
+    assert [event.type for event in bus.replay(jid)] == [
+        JOB_STARTED, JOB_LOG, FRAME_KEPT, JOB_DONE, JOB_CLEANUP,
+    ]
+    serve.JOBS.pop(jid, None)
+
+
+def test_cancel_endpoint_marks_job_terminal_and_requests_worker_stop(tmp_path):
+    jid = "cancel-job"
+    bus = JobEventBus(clock=lambda: 123.0)
+    cancel_event = threading.Event()
+    serve.JOBS[jid] = {"state": "running", "log": "", "out_dir": str(tmp_path), "bus": bus,
+                        "cancel_event": cancel_event}
+    server, _thread = _server()
+    try:
+        status, response = _post(server, f"/cancel?id={jid}")
+        assert status == 200
+        assert response == {"state": "cancelling"}
+        assert cancel_event.is_set()
+        assert [event.type for event in bus.replay(jid)] == [JOB_CANCELLED]
+    finally:
+        server.shutdown()
+        server.server_close()
+        serve.JOBS.pop(jid, None)
+
+
+def test_cancelled_worker_finishes_with_cleanup(tmp_path, monkeypatch):
+    jid = "cancelled-worker"
+    bus = JobEventBus(clock=lambda: 123.0)
+    cancel_event = threading.Event()
+    cancel_event.set()
+    bus.cancel(jid, "user requested")
+    serve.JOBS[jid] = {"state": "cancelling", "log": "", "out_dir": str(tmp_path), "bus": bus,
+                        "cancel_event": cancel_event}
+
+    def cancelled_process(*_args, **_kwargs):
+        raise serve.ProcessingCancelled("job cancelled")
+
+    monkeypatch.setattr(serve, "process", cancelled_process)
+    serve._run_job(jid, "input.mp4", {"grid": False, "transcribe": False})
+
+    assert serve.JOBS[jid]["state"] == "cancelled"
+    assert [event.type for event in bus.replay(jid)] == [JOB_CANCELLED, JOB_CLEANUP]
     serve.JOBS.pop(jid, None)
