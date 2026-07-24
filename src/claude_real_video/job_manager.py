@@ -102,6 +102,13 @@ class JobManager:
         with self._lock:
             if job.bus.is_terminal(job.job_id):
                 return
+            # Cancellation wins the race with a worker that already completed
+            # its last pre-terminal check.  The decision and event emission are
+            # deliberately under this same mutex as request_cancel(), so a
+            # public ``cancelling`` state can never later become ``job_done``.
+            if event_type == JOB_DONE and (job.state == "cancelling" or job.cancel_event.is_set()):
+                event_type = JOB_CANCELLED
+                payload = {"reason": "user requested"}
             if event_type == JOB_DONE:
                 job.state = "done"
             elif event_type == JOB_CANCELLED:

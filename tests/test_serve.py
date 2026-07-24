@@ -130,6 +130,32 @@ def test_worker_owns_terminal_during_cancel_done_race(manager, monkeypatch):
     assert [event.type for event in events] == [JOB_STARTED, JOB_LOG, JOB_CANCELLED, JOB_CLEANUP]
 
 
+def test_cancellation_wins_after_worker_preterminal_check(manager):
+    """Lock the exact window: cancel lands after worker's last check, before done."""
+    job = _started_job(manager)
+    worker_checked = threading.Event()
+    allow_done = threading.Event()
+
+    def worker():
+        assert not job.cancel_event.is_set()
+        worker_checked.set()
+        assert allow_done.wait(timeout=1)
+        manager.terminal(job, JOB_DONE, {"frame_count": 1})
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    assert worker_checked.wait(timeout=1)
+    assert manager.request_cancel(job) == "cancelling"
+    allow_done.set()
+    thread.join(timeout=1)
+
+    assert not thread.is_alive()
+    assert job.state == "cancelled"
+    assert [event.type for event in job.bus.replay(job.job_id)] == [
+        JOB_STARTED, JOB_CANCELLED,
+    ]
+
+
 def test_cancel_endpoint_only_requests_intent(manager):
     job = _started_job(manager)
     server = _server()
