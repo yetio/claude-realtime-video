@@ -186,9 +186,7 @@ def test_cancellable_process_group_leaves_no_child(tmp_path):
     controller.cancel(); thread.join(timeout=3)
     assert outcome == ["cancelled"] and not thread.is_alive()
     for _ in range(30):
-        try:
-            os.kill(child_pid, 0)
-        except ProcessLookupError:
+        if not _process_exists(child_pid):
             break
         time.sleep(0.05)
     else:
@@ -251,3 +249,17 @@ def test_tiny_video_http_sse_e2e(manager, tmp_path):
 def shutil_which(name):
     from shutil import which
     return which(name)
+
+
+def _process_exists(pid):
+    if os.name == "nt":
+        result = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+            capture_output=True, text=True, check=False,
+        )
+        return str(pid) in result.stdout
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True

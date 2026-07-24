@@ -66,6 +66,8 @@ class ProcessController:
                                   "text": True, "errors": "replace"}
         if os.name == "posix":
             kwargs["start_new_session"] = True
+        elif hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         proc = subprocess.Popen(cmd, **kwargs)
         with self._lock:
             self._active = proc
@@ -101,7 +103,12 @@ class ProcessController:
             if os.name == "posix":
                 os.killpg(proc.pid, signal.SIGTERM)
             else:
-                proc.terminate()
+                # Windows has no POSIX process groups. taskkill /T is the
+                # equivalent tree operation, covering yt-dlp's ffmpeg child.
+                subprocess.run(
+                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                    capture_output=True, check=False,
+                )
         except (ProcessLookupError, PermissionError):
             # Some restricted POSIX hosts disallow group signals even when the
             # child was launched in a new session. Still stop the direct child;
@@ -118,7 +125,10 @@ class ProcessController:
             if os.name == "posix":
                 os.killpg(proc.pid, signal.SIGKILL)
             else:
-                proc.kill()
+                subprocess.run(
+                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                    capture_output=True, check=False,
+                )
         except (ProcessLookupError, PermissionError):
             if proc.poll() is None:
                 try:
