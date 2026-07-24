@@ -8,18 +8,22 @@ import json
 import mimetypes
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import threading
 import time
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 import webbrowser
 
-from .core import ProcessingCancelled, make_grids, process
-from .job_events import JOB_DONE, JOB_ERROR, JOB_LOG, JobEvent, JobEventBus
+from .core import ProcessingCancelled, ProcessingQuotaExceeded, make_grids, process
+from .job_events import (
+    JOB_DONE, JOB_ERROR, JOB_LOG, JOB_STARTED, JobEvent,
+)
+from .job_manager import JobManager
 from .viewer import write_viewer
 
-JOBS: dict = {}  # id -> {state, log, out_dir, err, bus}
+MANAGER = JobManager()
 
 PAGE = """<!doctype html>
 <html lang="zh-Hant"><head><meta charset="utf-8">
@@ -131,22 +135,23 @@ function endRun(message, isDone){
   if(isDone) done.style.display='block';
   if(message){ log.textContent += '\\n' + message; log.scrollTop=log.scrollHeight; }
 }
-function addFrame(data){
+function addFrame(event){
+  const data=event.payload;
   const path=data.artifact;
   if(!path) return;
   const a=document.createElement('a'), img=document.createElement('img'), label=document.createElement('span');
   const url='/artifacts?id='+encodeURIComponent(jid)+'&path='+encodeURIComponent(path);
   a.href=url; a.target='_blank'; img.src=url; img.alt=data.frame||path;
-  label.textContent=(data.frame||path)+(data.timestamp_seconds==null?'':' · '+data.timestamp_seconds.toFixed(2)+'s');
+  label.textContent=(data.frame||path)+(event.media_time_ms==null?'':' · '+(event.media_time_ms/1000).toFixed(2)+'s');
   a.append(img,label); frames.append(a); frames.style.display='grid';
 }
 function connectEvents(){
   stream=new EventSource('/events?id='+encodeURIComponent(jid));
-  stream.addEventListener('job_log', e=>{ const d=JSON.parse(e.data).data; if(d.message){ log.textContent += '\\n'+d.message; log.scrollTop=log.scrollHeight; } });
-  stream.addEventListener('frame_kept', e=>addFrame(JSON.parse(e.data).data));
+  stream.addEventListener('job_log', e=>{ const d=JSON.parse(e.data).payload; if(d.message){ log.textContent += '\\n'+d.message; log.scrollTop=log.scrollHeight; } });
+  stream.addEventListener('frame_kept', e=>addFrame(JSON.parse(e.data)));
   stream.addEventListener('job_done', ()=>endRun('', true));
   stream.addEventListener('job_cancelled', ()=>endRun(T.cancelled, false));
-  stream.addEventListener('job_error', e=>{ const d=JSON.parse(e.data).data; endRun(T.failed+': '+(d.message||''), false); });
+  stream.addEventListener('job_error', e=>{ const d=JSON.parse(e.data).payload; endRun(T.failed+': '+(d.code||''), false); });
 }
 f.addEventListener('submit', async e=>{
   e.preventDefault();
@@ -169,19 +174,25 @@ document.getElementById('openv').addEventListener('click', ()=>fetch('/open?id='
 
 
 def _run_job(jid: str, src: str, opts: dict) -> None:
-    job = JOBS[jid]
-    out = job["out_dir"]
-    bus: JobEventBus = job["bus"]
+    job = MANAGER.get(jid)
+    if job is None:
+        return
+    out = job.out_dir
+    bus = job.bus
 
     def event_sink(event_type: str, data: dict) -> None:
-        # core finishes its batch artifacts before the web-only viewer/grid
-        # artifacts. Hold job_done until those web artifacts are ready too.
+        # JobManager owns the public lifecycle. Core's start/terminal markers are
+        # observed here but never race the web worker's terminal transition.
+        if event_type == JOB_STARTED:
+            return
         if event_type == JOB_DONE:
-            job["done_event"] = dict(data)
+            MANAGER.capture_done(job, data)
+            return
+        if event_type == JOB_ERROR:
             return
         bus.emit(jid, event_type, data)
         if event_type == JOB_LOG:
-            job["log"] += f"{data.get('message', '')}\n"
+            MANAGER.append_log(job, str(data.get("message", "")))
 
     try:
         result = process(
@@ -190,28 +201,33 @@ def _run_job(jid: str, src: str, opts: dict) -> None:
             text_anchors=bool(opts.get("text_anchors")),
             do_transcribe=bool(opts.get("transcribe", True)),
             event_sink=event_sink,
-            cancel_check=job["cancel_event"].is_set,
+            cancel_check=job.cancel_event.is_set,
+            process_controller=job.controller,
         )
-        if job["cancel_event"].is_set():
-            job["state"] = "cancelled"
+        if job.cancel_event.is_set():
+            MANAGER.terminal(job, "job_cancelled", {"reason": "user requested"})
             return
         if opts.get("grid"):
             make_grids(result.frames_dir, out)
         write_viewer(out, result.video)
-        job["state"] = "done"
-        done_event = job.pop("done_event", None)
+        if not MANAGER.enforce_quota(job):
+            MANAGER.terminal(job, JOB_ERROR, {"error_type": "job_disk_quota_exceeded"})
+            return
+        done_event = job.done_event
         if done_event is None:
             done_event = {"frame_count": result.frame_count}
-        bus.emit(jid, JOB_DONE, done_event)
+        MANAGER.terminal(job, JOB_DONE, done_event)
+    except ProcessingQuotaExceeded:
+        MANAGER.terminal(job, JOB_ERROR, {"error_type": "job_disk_quota_exceeded"})
     except ProcessingCancelled:
-        job["state"] = "cancelled"
-    except Exception as e:  # noqa: BLE001 — whatever failed, show it in the UI
-        job["state"], job["err"] = "error", str(e)
-        if not bus.is_terminal(jid):
-            bus.emit(jid, JOB_ERROR, {"error_type": type(e).__name__, "message": str(e)})
+        MANAGER.terminal(job, "job_cancelled", {"reason": "user requested"})
+    except Exception as exc:  # The public payload is redacted by JobEventBus.
+        if job.cancel_event.is_set():
+            MANAGER.terminal(job, "job_cancelled", {"reason": "user requested"})
+        else:
+            MANAGER.terminal(job, JOB_ERROR, {"error_type": type(exc).__name__})
     finally:
-        if bus.is_terminal(jid) and not bus.has_cleanup(jid):
-            bus.cleanup(jid, "worker finished")
+        MANAGER.cleanup(job)
 
 
 def _query_value(path: str, key: str) -> str | None:
@@ -240,19 +256,39 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _events(self, jid: str, since: int) -> None:
-        job = JOBS.get(jid)
+        job = MANAGER.get(jid)
         if job is None:
             return self._json({"error": "unknown job"}, 404)
-        bus: JobEventBus = job["bus"]
+        if not MANAGER.acquire_client(job):
+            return self._json({"error": "too many event clients"}, 429)
+        bus = job.bus
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
+        # There is no unbounded per-client queue: the TCP buffer is bounded and
+        # a client that stops draining it is disconnected after this timeout.
+        previous_timeout = self.connection.gettimeout()
+        self.connection.settimeout(5.0)
         try:
             while True:
-                events = bus.wait_for_events(jid, since=since, timeout=15.0)
-                if events:
-                    for event in events:
+                replay = bus.wait_for_events(jid, since=since, timeout=15.0)
+                if replay.gap:
+                    self._write_sse("replay_gap", {
+                        "schema_version": 1, "job_id": jid,
+                        "first_retained_seq": replay.first_retained_seq,
+                    })
+                    return
+                if replay.events:
+                    # A client that cannot drain this bounded replay is dropped;
+                    # it reconnects with Last-Event-ID and receives gap/reset info.
+                    if len(replay.events) > 128:
+                        self._write_sse("replay_gap", {
+                            "schema_version": 1, "job_id": jid,
+                            "first_retained_seq": replay.events[-128].seq,
+                        })
+                        return
+                    for event in replay.events:
                         self._write_sse_event(event)
                         since = event.seq
                     if bus.is_terminal(jid):
@@ -262,8 +298,16 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 else:
                     self.wfile.write(b": keepalive\n\n")
                     self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, socket.timeout):
             return
+        finally:
+            self.connection.settimeout(previous_timeout)
+            MANAGER.release_client(job)
+
+    def _write_sse(self, event_type: str, payload: dict) -> None:
+        message = f"event: {event_type}\ndata: {json.dumps(payload, separators=(',', ':'))}\n\n"
+        self.wfile.write(message.encode("utf-8"))
+        self.wfile.flush()
 
     def _write_sse_event(self, event: JobEvent) -> None:
         payload = json.dumps(event.to_dict(), ensure_ascii=False, separators=(",", ":"))
@@ -272,17 +316,26 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.flush()
 
     def _artifact(self, jid: str, artifact: str | None) -> None:
-        job = JOBS.get(jid)
+        job = MANAGER.get(jid)
         if job is None:
             return self._json({"error": "unknown job"}, 404)
         if not artifact:
             return self._json({"error": "missing artifact path"}, 400)
-        path = _safe_artifact_path(job["out_dir"], artifact)
+        path = _safe_artifact_path(job.out_dir, artifact)
         if path is None:
             return self._json({"error": "artifact not found"}, 404)
-        content_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
+        content_type = mimetypes.guess_type(path)[0]
+        allowed_types = {
+            "image/jpeg", "image/png", "image/webp", "video/mp4",
+            "text/plain", "application/json",
+        }
+        if content_type not in allowed_types:
+            return self._json({"error": "unsupported artifact type"}, 404)
+        filename = quote(os.path.basename(path), safe="")
         self.send_response(200)
         self.send_header("Content-Type", content_type)
+        disposition = "inline" if content_type.startswith(("image/", "video/")) else "attachment"
+        self.send_header("Content-Disposition", f"{disposition}; filename*=UTF-8''{filename}")
         self.send_header("Content-Length", str(os.path.getsize(path)))
         self.end_headers()
         with open(path, "rb") as f:
@@ -298,9 +351,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(body)
         elif self.path.startswith("/status"):
             jid = _query_value(self.path, "id")
-            j = JOBS.get(jid)
-            self._json({"state": j["state"], "log": j["log"][-4000:], "err": j.get("err")}
-                       if j else {"state": "error", "err": "unknown job"})
+            job = MANAGER.get(jid)
+            self._json({"state": job.state, "log": job.log, "err": job.error_code}
+                       if job else {"state": "error", "err": "unknown job"})
         elif self.path.startswith("/events"):
             jid = _query_value(self.path, "id")
             raw_since = _query_value(self.path, "since") or self.headers.get("Last-Event-ID") or "0"
@@ -313,9 +366,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self._artifact(_query_value(self.path, "id") or "", _query_value(self.path, "path"))
         elif self.path.startswith("/open"):
             jid = _query_value(self.path, "id")
-            j = JOBS.get(jid)
-            if j:
-                viewer = os.path.join(j["out_dir"], "viewer.html")
+            job = MANAGER.get(jid)
+            if job:
+                viewer = os.path.join(job.out_dir, "viewer.html")
                 opener = "open" if sys.platform == "darwin" else "xdg-open"
                 if shutil.which(opener) and os.path.exists(viewer):
                     subprocess.Popen([opener, viewer])
@@ -328,14 +381,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path.startswith("/cancel"):
             jid = _query_value(self.path, "id") or ""
-            job = JOBS.get(jid)
+            job = MANAGER.get(jid)
             if job is None:
                 return self._json({"error": "unknown job"}, 404)
-            if not job["bus"].is_terminal(jid):
-                job["cancel_event"].set()
-                job["bus"].cancel(jid, "user requested")
-                job["state"] = "cancelling"
-            return self._json({"state": job["state"]})
+            return self._json({"state": MANAGER.request_cancel(job)})
         if self.path != "/run":
             return self.send_error(404)
         n = int(self.headers.get("Content-Length", 0))
@@ -343,15 +392,14 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         src = (data.get("src") or "").strip()
         if not src:
             return self._json({"error": "missing src"}, 400)
-        jid = str(int(time.time() * 1000))
-        out = os.path.join(os.path.expanduser("~/crv-web-out"), jid)
-        JOBS[jid] = {
-            "state": "running", "log": "", "out_dir": out,
-            "bus": JobEventBus(), "cancel_event": threading.Event(),
-        }
-        threading.Thread(target=_run_job, args=(jid, src, data.get("opts") or {}),
+        try:
+            job = MANAGER.create()
+        except RuntimeError as exc:
+            return self._json({"error": str(exc)}, 429)
+        MANAGER.start(job, "url" if src.startswith(("http://", "https://")) else "file")
+        threading.Thread(target=_run_job, args=(job.job_id, src, data.get("opts") or {}),
                          daemon=True).start()
-        self._json({"id": jid})
+        self._json({"id": job.job_id})
 
 
 def main() -> None:

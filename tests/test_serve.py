@@ -1,162 +1,253 @@
-"""HTTP regressions for the local realtime event and artifact endpoints."""
-
+"""HTTP integration tests for the local realtime viewer and job ownership."""
 from __future__ import annotations
 
 import http.client
 import json
+import os
+import subprocess
+import sys
 import threading
+import time
 from types import SimpleNamespace
 
+import pytest
+
 from claude_real_video import serve
-from claude_real_video.job_events import (
-    JOB_CANCELLED,
-    JOB_CLEANUP,
-    JOB_DONE,
-    FRAME_KEPT,
-    JOB_LOG,
-    JOB_STARTED,
-    SOURCE_READY,
-    JobEventBus,
-)
+from claude_real_video.core import ProcessController, ProcessingCancelled
+from claude_real_video.job_events import JOB_CANCELLED, JOB_CLEANUP, JOB_DONE, JOB_LOG, JOB_STARTED, SOURCE_READY
+from claude_real_video.job_manager import JobManager
+
+
+@pytest.fixture
+def manager(tmp_path, monkeypatch):
+    instance = JobManager(output_root=str(tmp_path / "out"), retention_seconds=0.01, max_events_per_job=32)
+    monkeypatch.setattr(serve, "MANAGER", instance)
+    return instance
 
 
 def _server():
     server = serve.http.server.ThreadingHTTPServer(("127.0.0.1", 0), serve._Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    return server, thread
+    return server
 
 
 def _get(server, path, headers=None):
-    conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+    conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=8)
     conn.request("GET", path, headers=headers or {})
     response = conn.getresponse()
     body = response.read()
+    headers = dict(response.getheaders())
     conn.close()
-    return response.status, dict(response.getheaders()), body
+    return response.status, headers, body
 
 
-def _post(server, path):
-    conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
-    conn.request("POST", path)
+def _post(server, path, payload=None):
+    body = json.dumps(payload).encode() if payload is not None else None
+    conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=8)
+    conn.request("POST", path, body=body, headers={"Content-Type": "application/json"} if body else {})
     response = conn.getresponse()
-    body = response.read()
+    data = response.read()
+    status = response.status
     conn.close()
-    return response.status, json.loads(body)
+    return status, json.loads(data)
 
 
-def test_sse_replays_from_since_and_last_event_id(tmp_path):
-    jid = "events-job"
-    bus = JobEventBus(clock=lambda: 123.0)
-    serve.JOBS[jid] = {"state": "done", "log": "", "out_dir": str(tmp_path), "bus": bus,
-                        "cancel_event": threading.Event()}
-    bus.emit(jid, JOB_STARTED, {"source_kind": "file"})
-    bus.emit(jid, SOURCE_READY, {"artifact": "source.mp4"})
-    bus.emit(jid, JOB_DONE, {"frame_count": 1})
-    server, _thread = _server()
+def _started_job(manager, kind="file"):
+    job = manager.create()
+    manager.start(job, kind)
+    return job
+
+
+def test_sse_replay_and_gap_signal(manager):
+    job = _started_job(manager)
+    job.bus.emit(job.job_id, SOURCE_READY, {"artifact": "source.mp4"})
+    manager.terminal(job, JOB_DONE, {"frame_count": 1})
+    server = _server()
     try:
-        status, headers, body = _get(server, f"/events?id={jid}&since=1")
-        text = body.decode("utf-8")
-        assert status == 200
-        assert headers["Content-Type"].startswith("text/event-stream")
-        assert "id: 2" in text and "event: source_ready" in text
-        assert "id: 3" in text and "event: job_done" in text
-        assert "id: 1" not in text
-
-        status, _headers, body = _get(server, f"/events?id={jid}", {"Last-Event-ID": "2"})
-        assert status == 200
-        assert "id: 3" in body.decode("utf-8")
+        status, headers, body = _get(server, f"/events?id={job.job_id}&since=1")
+        text = body.decode()
+        assert status == 200 and headers["Content-Type"].startswith("text/event-stream")
+        assert "event: source_ready" in text and "event: job_done" in text
+        status, _headers, body = _get(server, f"/events?id={job.job_id}", {"Last-Event-ID": "2"})
+        assert status == 200 and "event: job_done" in body.decode()
     finally:
-        server.shutdown()
-        server.server_close()
-        serve.JOBS.pop(jid, None)
+        server.shutdown(); server.server_close()
 
 
-def test_artifact_endpoint_stays_inside_job_output(tmp_path):
-    jid = "artifact-job"
-    frames = tmp_path / "frames"
-    frames.mkdir()
-    image = frames / "frame_001.jpg"
-    image.write_bytes(b"jpeg-bytes")
-    secret = tmp_path.parent / "secret.txt"
-    secret.write_text("not for this job", encoding="utf-8")
-    serve.JOBS[jid] = {"state": "done", "log": "", "out_dir": str(tmp_path), "bus": JobEventBus(),
-                        "cancel_event": threading.Event()}
-    server, _thread = _server()
+def test_sse_replay_gap_is_explicit(manager):
+    job = _started_job(manager)
+    for index in range(40):
+        job.bus.emit(job.job_id, JOB_LOG, {"message": str(index)})
+    server = _server()
     try:
-        status, headers, body = _get(server, f"/artifacts?id={jid}&path=frames/frame_001.jpg")
-        assert status == 200
-        assert headers["Content-Type"].startswith("image/jpeg")
-        assert body == b"jpeg-bytes"
-
-        status, _headers, body = _get(server, f"/artifacts?id={jid}&path=../secret.txt")
-        assert status == 404
-        assert json.loads(body) == {"error": "artifact not found"}
+        status, _headers, body = _get(server, f"/events?id={job.job_id}&since=0")
+        assert status == 200 and "event: replay_gap" in body.decode()
     finally:
-        server.shutdown()
-        server.server_close()
-        serve.JOBS.pop(jid, None)
+        server.shutdown(); server.server_close()
 
 
-def test_web_runner_routes_core_events_to_its_job_bus(tmp_path, monkeypatch):
-    jid = "run-job"
-    bus = JobEventBus(clock=lambda: 123.0)
-    serve.JOBS[jid] = {"state": "running", "log": "", "out_dir": str(tmp_path), "bus": bus,
-                        "cancel_event": threading.Event()}
+def test_artifacts_reject_escape_variants_and_serve_image(manager, tmp_path):
+    job = _started_job(manager)
+    os.makedirs(job.out_dir, exist_ok=True)
+    frames = os.path.join(job.out_dir, "frames")
+    os.mkdir(frames)
+    image = os.path.join(frames, "frame.jpg")
+    open(image, "wb").write(b"jpeg")
+    html = os.path.join(job.out_dir, "untrusted.html")
+    open(html, "w").write("<script>alert(1)</script>")
+    outside = tmp_path / "out-old" / "secret.txt"
+    outside.parent.mkdir(); outside.write_text("secret")
+    os.symlink(outside, os.path.join(job.out_dir, "escape"))
+    server = _server()
+    try:
+        status, headers, _body = _get(server, f"/artifacts?id={job.job_id}&path=frames/frame.jpg")
+        assert status == 200
+        assert headers["Content-Type"] == "image/jpeg"
+        assert headers["Content-Disposition"].startswith("inline;")
+        for artifact in ("../out-old/secret.txt", str(outside), "escape", "missing.jpg"):
+            assert _get(server, f"/artifacts?id={job.job_id}&path={artifact}")[0] == 404
+        assert _get(server, f"/artifacts?id={job.job_id}&path=untrusted.html")[0] == 404
+    finally:
+        server.shutdown(); server.server_close()
+
+
+def test_worker_owns_terminal_during_cancel_done_race(manager, monkeypatch):
+    job = _started_job(manager)
 
     def fake_process(_src, out_dir, *, event_sink, **_kwargs):
         event_sink(JOB_STARTED, {"source_kind": "file"})
         event_sink(JOB_LOG, {"message": "extracting"})
-        event_sink(FRAME_KEPT, {"artifact": "frames/frame_001.jpg"})
+        serve.MANAGER.request_cancel(job)
         event_sink(JOB_DONE, {"frame_count": 1})
-        return SimpleNamespace(frames_dir=out_dir + "/frames", video=out_dir + "/source.mp4")
+        return SimpleNamespace(frames_dir=out_dir, video=out_dir + "/source.mp4", frame_count=1)
 
     monkeypatch.setattr(serve, "process", fake_process)
     monkeypatch.setattr(serve, "write_viewer", lambda *_args: "viewer.html")
-    serve._run_job(jid, "input.mp4", {"grid": False, "transcribe": False})
-
-    assert serve.JOBS[jid]["state"] == "done"
-    assert "extracting" in serve.JOBS[jid]["log"]
-    assert [event.type for event in bus.replay(jid)] == [
-        JOB_STARTED, JOB_LOG, FRAME_KEPT, JOB_DONE, JOB_CLEANUP,
-    ]
-    serve.JOBS.pop(jid, None)
+    serve._run_job(job.job_id, "input.mp4", {"grid": False, "transcribe": False})
+    events = job.bus.replay(job.job_id)
+    assert job.state == "cancelled"
+    assert [event.type for event in events] == [JOB_STARTED, JOB_LOG, JOB_CANCELLED, JOB_CLEANUP]
 
 
-def test_cancel_endpoint_marks_job_terminal_and_requests_worker_stop(tmp_path):
-    jid = "cancel-job"
-    bus = JobEventBus(clock=lambda: 123.0)
-    cancel_event = threading.Event()
-    serve.JOBS[jid] = {"state": "running", "log": "", "out_dir": str(tmp_path), "bus": bus,
-                        "cancel_event": cancel_event}
-    server, _thread = _server()
+def test_cancel_endpoint_only_requests_intent(manager):
+    job = _started_job(manager)
+    server = _server()
     try:
-        status, response = _post(server, f"/cancel?id={jid}")
-        assert status == 200
-        assert response == {"state": "cancelling"}
-        assert cancel_event.is_set()
-        assert [event.type for event in bus.replay(jid)] == [JOB_CANCELLED]
+        status, payload = _post(server, f"/cancel?id={job.job_id}")
+        assert status == 200 and payload == {"state": "cancelling"}
+        assert job.cancel_event.is_set()
+        assert [event.type for event in job.bus.replay(job.job_id)] == [JOB_STARTED]
     finally:
-        server.shutdown()
-        server.server_close()
-        serve.JOBS.pop(jid, None)
+        server.shutdown(); server.server_close()
 
 
-def test_cancelled_worker_finishes_with_cleanup(tmp_path, monkeypatch):
-    jid = "cancelled-worker"
-    bus = JobEventBus(clock=lambda: 123.0)
-    cancel_event = threading.Event()
-    cancel_event.set()
-    bus.cancel(jid, "user requested")
-    serve.JOBS[jid] = {"state": "cancelling", "log": "", "out_dir": str(tmp_path), "bus": bus,
-                        "cancel_event": cancel_event}
+def test_cancellable_process_group_stops_child_work():
+    controller = ProcessController()
+    outcome = []
 
-    def cancelled_process(*_args, **_kwargs):
-        raise serve.ProcessingCancelled("job cancelled")
+    def run():
+        try:
+            controller.run([sys.executable, "-c", "import time; time.sleep(30)"])
+        except ProcessingCancelled:
+            outcome.append("cancelled")
 
-    monkeypatch.setattr(serve, "process", cancelled_process)
-    serve._run_job(jid, "input.mp4", {"grid": False, "transcribe": False})
+    thread = threading.Thread(target=run)
+    thread.start(); time.sleep(0.1); controller.cancel(); thread.join(timeout=3)
+    assert outcome == ["cancelled"] and not thread.is_alive()
 
-    assert serve.JOBS[jid]["state"] == "cancelled"
-    assert [event.type for event in bus.replay(jid)] == [JOB_CANCELLED, JOB_CLEANUP]
-    serve.JOBS.pop(jid, None)
+
+def test_cancellable_process_group_leaves_no_child(tmp_path):
+    """Cancellation targets the child process group, not only its parent."""
+    pid_file = tmp_path / "child.pid"
+    script = (
+        "import subprocess, sys, time\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+        f"open({str(pid_file)!r}, 'w').write(str(child.pid))\n"
+        "time.sleep(30)\n"
+    )
+    controller = ProcessController()
+    outcome = []
+
+    def run():
+        try:
+            controller.run([sys.executable, "-c", script])
+        except ProcessingCancelled:
+            outcome.append("cancelled")
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    for _ in range(30):
+        if pid_file.exists():
+            break
+        time.sleep(0.05)
+    assert pid_file.exists(), "parent did not start its child"
+    child_pid = int(pid_file.read_text())
+    controller.cancel(); thread.join(timeout=3)
+    assert outcome == ["cancelled"] and not thread.is_alive()
+    for _ in range(30):
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail(f"orphan child process remains: {child_pid}")
+
+
+def test_manager_bounds_ids_clients_retention_and_quota(tmp_path):
+    instance = JobManager(output_root=str(tmp_path / "out"), max_jobs=32,
+                          max_clients_per_job=1, retention_seconds=0.01,
+                          max_job_bytes=2)
+    jobs = []
+    threads = [threading.Thread(target=lambda: jobs.append(instance.create())) for _ in range(32)]
+    for thread in threads: thread.start()
+    for thread in threads: thread.join()
+    assert len({job.job_id for job in jobs}) == 32
+
+    job = jobs[0]
+    os.makedirs(job.out_dir)
+    open(os.path.join(job.out_dir, "too-large.bin"), "wb").write(b"123")
+    assert not instance.enforce_quota(job)
+    instance.start(job, "file")
+    instance.terminal(job, JOB_DONE, {})
+    instance.cleanup(job)
+    assert instance.acquire_client(job)
+    assert not instance.acquire_client(job)
+    assert instance.reap_expired(now=job.cleaned_at + 1) == []
+    instance.release_client(job)
+    assert instance.reap_expired(now=job.cleaned_at + 1) == [job.job_id]
+    assert job.bus.replay(job.job_id) == []
+
+
+def test_tiny_video_http_sse_e2e(manager, tmp_path):
+    if not shutil_which("ffmpeg"):
+        pytest.skip("ffmpeg not installed")
+    source = tmp_path / "tiny.mp4"
+    subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=duration=1:size=160x120:rate=5",
+                    "-pix_fmt", "yuv420p", str(source)], check=True, capture_output=True)
+    server = _server()
+    try:
+        status, created = _post(server, "/run", {"src": str(source), "opts": {"grid": False, "transcribe": False}})
+        assert status == 200
+        status, _headers, body = _get(server, f"/events?id={created['id']}")
+        text = body.decode()
+        assert status == 200
+        assert "event: job_started" in text and "event: frame_kept" in text and "event: job_done" in text
+        payloads = [json.loads(line[6:]) for line in text.splitlines() if line.startswith("data: ")]
+        frame = next(payload for payload in payloads if payload["type"] == "frame_kept")
+        assert frame["schema_version"] == 1
+        assert frame["payload"]["artifact"].startswith("frames/")
+        assert "media_time_ms" in frame
+        assert "JSON.parse(e.data).payload" in serve.PAGE
+        assert "addFrame(JSON.parse(e.data))" in serve.PAGE
+        last = max(int(line[4:]) for line in text.splitlines() if line.startswith("id: "))
+        status, _headers, replay = _get(server, f"/events?id={created['id']}", {"Last-Event-ID": str(last - 1)})
+        assert status == 200 and f"id: {last}" in replay.decode()
+    finally:
+        server.shutdown(); server.server_close()
+
+
+def shutil_which(name):
+    from shutil import which
+    return which(name)

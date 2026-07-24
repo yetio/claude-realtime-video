@@ -1,11 +1,15 @@
 """Core pipeline: fetch a video (URL or file), extract scene-aware + deduplicated
 frames, optionally transcribe audio, and write a manifest an LLM can read."""
 from __future__ import annotations
+from contextvars import ContextVar
 import glob
 import os
 import re
+import signal
 import shutil
 import subprocess
+import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -27,10 +31,100 @@ TRANSCRIPT_END = "--- END UNTRUSTED TRANSCRIPT ---"
 
 EventSink = Callable[[str, dict[str, Any]], None]
 CancelCheck = Callable[[], bool]
+_ACTIVE_PROCESS_CONTROLLER: ContextVar["ProcessController | None"] = ContextVar(
+    "active_process_controller", default=None)
 
 
 class ProcessingCancelled(RuntimeError):
     """Raised when a caller stops a batch job at a pipeline checkpoint."""
+
+
+class ProcessingQuotaExceeded(RuntimeError):
+    """Raised when a managed job exceeds its configured output budget."""
+
+
+class ProcessController:
+    """Own a pipeline subprocess group so a web cancellation can stop real work."""
+
+    def __init__(self, cancel_event: threading.Event | None = None,
+                 quota_check: Callable[[], bool] | None = None) -> None:
+        self.cancel_event = cancel_event or threading.Event()
+        self.quota_check = quota_check
+        self._lock = threading.RLock()
+        self._active: subprocess.Popen[str] | None = None
+
+    def cancel(self) -> None:
+        self.cancel_event.set()
+        with self._lock:
+            if self._active is not None and self._active.poll() is None:
+                self._stop_group(self._active)
+
+    def run(self, cmd: list[str]) -> subprocess.CompletedProcess[str]:
+        if self.cancel_event.is_set():
+            raise ProcessingCancelled("job cancelled")
+        kwargs: dict[str, Any] = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE,
+                                  "text": True, "errors": "replace"}
+        if os.name == "posix":
+            kwargs["start_new_session"] = True
+        proc = subprocess.Popen(cmd, **kwargs)
+        with self._lock:
+            self._active = proc
+        try:
+            while proc.poll() is None:
+                if self.quota_check is not None and not self.quota_check():
+                    self.cancel_event.set()
+                    self._stop_group(proc)
+                    try:
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        self._kill_group(proc)
+                        proc.wait(timeout=2)
+                    raise ProcessingQuotaExceeded("job output quota exceeded")
+                if self.cancel_event.wait(0.05):
+                    self._stop_group(proc)
+                    try:
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        self._kill_group(proc)
+                        proc.wait(timeout=2)
+                    raise ProcessingCancelled("job cancelled")
+            stdout, stderr = proc.communicate()
+            return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+        finally:
+            with self._lock:
+                if self._active is proc:
+                    self._active = None
+
+    @staticmethod
+    def _stop_group(proc: subprocess.Popen[str]) -> None:
+        try:
+            if os.name == "posix":
+                os.killpg(proc.pid, signal.SIGTERM)
+            else:
+                proc.terminate()
+        except (ProcessLookupError, PermissionError):
+            # Some restricted POSIX hosts disallow group signals even when the
+            # child was launched in a new session. Still stop the direct child;
+            # normal hosts retain the stronger group termination above.
+            if proc.poll() is None:
+                try:
+                    proc.terminate()
+                except ProcessLookupError:
+                    pass
+
+    @staticmethod
+    def _kill_group(proc: subprocess.Popen[str]) -> None:
+        try:
+            if os.name == "posix":
+                os.killpg(proc.pid, signal.SIGKILL)
+            else:
+                proc.kill()
+        except (ProcessLookupError, PermissionError):
+            if proc.poll() is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
 
 
 def _emit_event(event_sink: EventSink | None, event_type: str, data: dict[str, Any] | None = None) -> None:
@@ -53,6 +147,9 @@ def _raise_if_cancelled(cancel_check: CancelCheck | None) -> None:
 def _run(cmd: list[str]) -> subprocess.CompletedProcess:
     # errors="replace": Latin-1-ish metadata tags crash strict UTF-8 decoding
     # (2,181-video field report — ~40 videos from one generator all died)
+    controller = _ACTIVE_PROCESS_CONTROLLER.get()
+    if controller is not None:
+        return controller.run(cmd)
     return subprocess.run(cmd, capture_output=True, text=True, errors="replace")
 
 
@@ -964,38 +1061,44 @@ def process(src: str, out_dir: str, *, scene: float = 0.30, fps_floor: float = 1
             keep_audio: bool = False, report: bool = False, why: str | None = None, whisper_model: str = "base", cookies_from_browser: str | None = None,
             overwrite: bool = False, speakers: bool = False,
             export: str | None = None, event_sink: EventSink | None = None,
-            cancel_check: CancelCheck | None = None) -> Result:
+            cancel_check: CancelCheck | None = None,
+            process_controller: ProcessController | None = None) -> Result:
     """Run the batch pipeline, optionally mirroring milestones to ``event_sink``.
 
     The sink receives ``(event_type, JSON-serializable data)``. It is an
     observational hook: errors from it are deliberately ignored so existing
     CLI callers retain their current output and failure behaviour.
     """
-    _emit_event(event_sink, JOB_STARTED, {"source_kind": "url" if src.startswith(("http://", "https://")) else "file"})
+    token = _ACTIVE_PROCESS_CONTROLLER.set(process_controller) if process_controller else None
     try:
-        result = _process(
-            src, out_dir,
-            scene=scene, fps_floor=fps_floor, adaptive=adaptive,
-            text_anchors=text_anchors, max_frames=max_frames, lang=lang,
-            cookies=cookies, do_transcribe=do_transcribe,
-            dedup_threshold=dedup_threshold, dedup_window=dedup_window,
-            keep_audio=keep_audio, report=report, why=why,
-            whisper_model=whisper_model, cookies_from_browser=cookies_from_browser,
-            overwrite=overwrite, speakers=speakers, export=export,
-            event_sink=event_sink, cancel_check=cancel_check,
-        )
-    except ProcessingCancelled:
-        raise
-    except Exception as exc:
-        _emit_event(event_sink, JOB_ERROR, {"error_type": type(exc).__name__, "message": str(exc)})
-        raise
-    _emit_event(event_sink, JOB_DONE, {
-        "frame_count": result.frame_count,
-        "extracted_frames": result.extracted_frames,
-        "duration_seconds": result.duration,
-        "manifest_artifact": "MANIFEST.txt",
-    })
-    return result
+        _emit_event(event_sink, JOB_STARTED, {"source_kind": "url" if src.startswith(("http://", "https://")) else "file"})
+        try:
+            result = _process(
+                src, out_dir,
+                scene=scene, fps_floor=fps_floor, adaptive=adaptive,
+                text_anchors=text_anchors, max_frames=max_frames, lang=lang,
+                cookies=cookies, do_transcribe=do_transcribe,
+                dedup_threshold=dedup_threshold, dedup_window=dedup_window,
+                keep_audio=keep_audio, report=report, why=why,
+                whisper_model=whisper_model, cookies_from_browser=cookies_from_browser,
+                overwrite=overwrite, speakers=speakers, export=export,
+                event_sink=event_sink, cancel_check=cancel_check,
+            )
+        except ProcessingCancelled:
+            raise
+        except Exception as exc:
+            _emit_event(event_sink, JOB_ERROR, {"error_type": type(exc).__name__, "message": str(exc)})
+            raise
+        _emit_event(event_sink, JOB_DONE, {
+            "frame_count": result.frame_count,
+            "extracted_frames": result.extracted_frames,
+            "duration_seconds": result.duration,
+            "manifest_artifact": "MANIFEST.txt",
+        })
+        return result
+    finally:
+        if token is not None:
+            _ACTIVE_PROCESS_CONTROLLER.reset(token)
 
 
 def _process(src: str, out_dir: str, *, scene: float = 0.30, fps_floor: float = 1.0,

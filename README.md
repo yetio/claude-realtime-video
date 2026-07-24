@@ -162,6 +162,28 @@ M1 introduces a typed local event contract around the existing pipeline:
   directory and rejects path traversal;
 - cancel and cleanup paths so every job reaches a terminal event.
 
+#### M1 event contract (v1)
+
+Every SSE event has `schema_version: 1`, `job_id`, monotonic `seq`, `type`,
+RFC 3339 UTC `occurred_at`, and an allowlisted `payload`; frame events also
+carry `media_time_ms`. Artifact fields are relative paths only. A job is always
+`job_started → exactly one of job_done/job_error/job_cancelled → job_cleanup`.
+The web `JobManager` is the single owner of those transitions; `/cancel` merely
+requests cancellation, then the worker terminates and waits for its active
+process group before publishing the terminal event.
+
+Replay, jobs and output are bounded: each job has a limited event buffer and
+disk budget, jobs use UUIDs, completed jobs are retained for a finite period,
+and SSE has a per-job client limit plus a slow-client disconnect timeout. A
+reconnect whose `Last-Event-ID` predates the retained buffer receives a
+`replay_gap` event and must reset its view. Error payloads expose stable error
+codes only; source URLs, command lines and local paths are not sent to clients.
+The local defaults are 2 concurrent jobs, 4 SSE clients per job, 512 replay
+events and 512 MiB per job, one-hour retention, and a five-second blocked-write
+timeout. Text payloads are capped at 2,000 characters (selection/drop reasons
+at 80; cancellation/cleanup reasons at 160), and adjacent `frame_dropped`
+events are aggregated into a count rather than replayed one per frame.
+
 Status: the event bus, batch-pipeline event sink, replayable SSE endpoint,
 safe artifact serving, incremental web viewer, cancellation and terminal
 cleanup controls are in place.
