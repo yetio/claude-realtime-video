@@ -39,7 +39,7 @@ def test_cross_window_dedup_releases_an_unchanged_frame_after_ttl():
     assert dedup.keep("static-camera", 5_000)
 
 
-def test_late_frame_never_pollutes_dedup_and_lateness_releases_in_source_order():
+def test_late_frame_never_pollutes_dedup_minimal_reproduction():
     runner = SegmentRunner(allowed_lateness_ms=0, dedup_ttl_ms=5_000)
     assert [(item.media_time_ms, item.kind) for item in runner.frame("first", 10_000)] == [
         (10_000, "frame_kept"),
@@ -50,6 +50,8 @@ def test_late_frame_never_pollutes_dedup_and_lateness_releases_in_source_order()
         (12_000, "frame_kept"),
     ]
 
+
+def test_allowed_lateness_applies_dedup_in_source_time_order():
     runner = SegmentRunner(allowed_lateness_ms=1_000, dedup_ttl_ms=5_000)
     assert runner.frame("same", 3_000) == []
     assert runner.frame("same", 2_500) == []
@@ -57,6 +59,13 @@ def test_late_frame_never_pollutes_dedup_and_lateness_releases_in_source_order()
         (2_500, "frame_kept"),
         (3_000, "frame_dropped"),
     ]
+
+
+def test_frame_beyond_watermark_does_not_change_future_signature_result():
+    runner = SegmentRunner(allowed_lateness_ms=0, dedup_ttl_ms=5_000)
+    assert runner.frame("watermark-advance", 20_000)[0].kind == "frame_kept"
+    assert runner.frame("retry-signature", 19_000) == []
+    assert runner.frame("retry-signature", 22_000)[0].kind == "frame_kept"
 
 
 def test_window_state_has_hard_capacity_and_reset_epoch_contract():
@@ -68,6 +77,12 @@ def test_window_state_has_hard_capacity_and_reset_epoch_contract():
     with pytest.raises(WindowStateOverflow, match="pending evidence capacity"):
         clock.add(TimedEvidence(300, "frame", {}))
     assert clock.pending_count == 2
+
+    byte_limited_clock = SourceWatermark(
+        allowed_lateness_ms=10_000, max_pending=10, max_pending_bytes=64,
+    )
+    with pytest.raises(WindowStateOverflow, match="byte limit"):
+        byte_limited_clock.add(TimedEvidence(100, "frame", {"data": "x" * 128}))
 
     dedup = WindowDeduplicator(ttl_ms=10_000, max_signatures=2)
     assert dedup.keep("a", 100)
@@ -82,6 +97,14 @@ def test_window_state_has_hard_capacity_and_reset_epoch_contract():
         runner.reset_epoch(999)
     runner.reset_epoch(1_000)
     assert runner.frame("same", 1_000)[0].kind == "frame_kept"
+
+
+def test_watermark_equal_timestamp_tie_break_keeps_arrival_order():
+    clock = SourceWatermark(allowed_lateness_ms=100)
+    assert clock.add(TimedEvidence(1_050, "frame", {"id": "first"})) == []
+    assert clock.add(TimedEvidence(1_050, "frame", {"id": "second"})) == []
+    released = clock.add(TimedEvidence(1_150, "frame", {"id": "advance"}))
+    assert [item.payload["id"] for item in released] == ["first", "second"]
 
 
 def test_transcript_source_id_handles_retry_jitter_without_merging_real_repeats():
@@ -179,13 +202,40 @@ def test_window_event_producer_reset_discards_old_pending_epoch():
     )
     producer.frame("same", 2_000, {"artifact": "old.jpg"})
     producer.reset_epoch(2_000)
+    assert producer.runner.clock.watermark_ms == 2_000
     producer.frame("same", 2_000, {"artifact": "new.jpg"})
+    assert producer.runner.clock.watermark_ms == 2_000
     producer.frame("other", 3_000, {"artifact": "other.jpg"})
     producer.finish()
 
     frames = [event for event in bus.replay("reset-job") if event.type == "frame_kept"]
     assert [event.payload["artifact"] for event in frames] == ["new.jpg", "other.jpg"]
     assert [event.media_time_ms for event in frames] == [2_000, 3_000]
+
+
+def test_long_stream_keeps_window_state_bounded_and_source_ordered():
+    emitted_times = []
+
+    def sink(_event_type, payload):
+        emitted_times.append(round(payload["timestamp_seconds"] * 1_000))
+
+    producer = WindowEventProducer(
+        sink,
+        allowed_lateness_ms=64,
+        dedup_ttl_ms=128,
+        max_pending=128,
+        max_pending_bytes=64 * 1024,
+        max_signatures=128,
+    )
+    for media_time_ms in range(5_000):
+        producer.frame(f"signature-{media_time_ms}", media_time_ms)
+        assert producer.runner.clock.pending_count <= 64
+        assert producer.runner.clock.pending_bytes <= 64 * 1024
+        assert producer.runner.dedup.signature_count <= 128
+    producer.finish()
+
+    assert emitted_times == list(range(5_000))
+    assert producer.runner.clock.pending_count == 0
 
 
 def test_local_segment_reader_emits_real_windowed_frames_to_m1_sink(tmp_path):
