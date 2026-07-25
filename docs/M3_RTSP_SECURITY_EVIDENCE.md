@@ -42,7 +42,9 @@ review. It does not claim release approval.
 
 ### Persisted artifacts
 
-- `MANIFEST.txt` stores only a redacted endpoint and numeric capture limits.
+- `MANIFEST.txt` stores only the constant `rtsp://<redacted>` label and numeric
+  capture limits. It never retains hostnames, IP addresses, ports, paths,
+  queries or userinfo.
 - `frames.json` stores relative frame names and source-clock timestamps.
 - CLI knowledge-base export uses `rtsp-stream-redacted` instead of the source
   URL when generating the note title and header.
@@ -71,7 +73,9 @@ PYTHONPATH=src python3.12 -m pytest tests/test_rtsp.py tests/test_job_events.py 
 The RTSP suite verifies separately:
 
 - credentials are present only inside the live `0600` config fixture;
-- URL credentials are absent from argv, repr, events, manifest and exceptions;
+- the complete RTSP authority is absent from repr, events, manifest, status and
+  knowledge-base exports across hostname, IPv4 and IPv6 sources;
+- URL credentials are absent from argv and exceptions;
 - temporary credentials are deleted on success, failure and cancellation;
 - authenticated CLI sources are rejected from argv and accepted only from a
   private `0600` source file;

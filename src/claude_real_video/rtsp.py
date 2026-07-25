@@ -14,7 +14,7 @@ import subprocess
 import tempfile
 import time
 from typing import Any, Callable, Iterator
-from urllib.parse import SplitResult, urlsplit
+from urllib.parse import urlsplit
 
 from .job_events import (
     STREAM_DONE,
@@ -100,7 +100,7 @@ class RtspSource:
             parts.port
         except ValueError as exc:
             raise ValueError("RTSP source has an invalid port") from exc
-        return cls(value, _redacted_endpoint(parts))
+        return cls(value, _redacted_endpoint())
 
     def __repr__(self) -> str:
         return f"RtspSource(redacted_url={self.redacted_url!r})"
@@ -416,12 +416,9 @@ def _showinfo_times(stderr: str) -> list[float]:
     )]
 
 
-def _redacted_endpoint(parts: SplitResult) -> str:
-    host = parts.hostname or "invalid"
-    if ":" in host:
-        host = f"[{host}]"
-    port = f":{parts.port}" if parts.port is not None else ""
-    return f"rtsp://{host}{port}/<redacted>"
+def _redacted_endpoint() -> str:
+    """Return the only RTSP source label allowed on public/persisted surfaces."""
+    return "rtsp://<redacted>"
 
 
 _RETRYABLE_CODES = frozenset({

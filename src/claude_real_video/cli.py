@@ -162,7 +162,7 @@ def main() -> None:
         print(f"  grids:      {len(sheets)} contact sheet(s) in {r.out_dir}/grids")
     if args.kb:
         from .core import save_to_kb
-        kb_source = "rtsp-stream-redacted" if source.lower().startswith("rtsp://") else source
+        kb_source = _kb_source_label(source)
         dest = save_to_kb(args.kb, r.manifest_path, kb_source)
         print(f"  knowledge base: {dest}")
     # one quiet pointer, opt out with CRV_NO_HINT=1
@@ -201,6 +201,11 @@ def _resolve_source(source: str | None, rtsp_source_file: str | None) -> str:
         if parts.username is not None or parts.password is not None:
             raise ValueError("authenticated RTSP URLs must use --rtsp-source-file")
     return source
+
+
+def _kb_source_label(source: str) -> str:
+    """Keep the complete RTSP authority out of exported note names and headers."""
+    return "rtsp-stream-redacted" if source.lower().startswith("rtsp://") else source
 
 
 if __name__ == "__main__":

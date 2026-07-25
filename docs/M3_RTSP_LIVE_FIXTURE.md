@@ -21,7 +21,11 @@ Run the fixture from the repository root:
 PYTHONPATH=src python3 -m pytest -q tests/test_rtsp_live.py
 ```
 
-The test skips only when `ffmpeg` is absent. The server binds to
-`127.0.0.1`, accepts one connection, has no authentication surface, and is
-stopped in a `finally` path. Production credential handling remains covered
-separately by `docs/M3_RTSP_SECURITY_EVIDENCE.md` and `tests/test_rtsp.py`.
+Local development skips the fixture when `ffmpeg` is absent. CI sets
+`CRV_REQUIRE_FFMPEG=1`, runs `ffmpeg -version` as a fail-closed preflight, and
+executes this fixture explicitly before the full suite; a missing dependency
+therefore fails the release gate instead of becoming a green skip. The server
+binds to `127.0.0.1`, accepts one connection, has no authentication surface,
+and is stopped in a `finally` path. Production credential handling remains
+covered separately by `docs/M3_RTSP_SECURITY_EVIDENCE.md` and
+`tests/test_rtsp.py`.

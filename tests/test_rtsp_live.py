@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import json
+import os
 from pathlib import Path
 import shutil
 import socket
@@ -16,8 +17,8 @@ import pytest
 from claude_real_video.core import process
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
 def test_local_rtsp_fixture_produces_real_frames(tmp_path):
+    _require_ffmpeg()
     events = []
     with local_rtsp_fixture(tmp_path) as source_url:
         result = process(
@@ -42,6 +43,21 @@ def test_local_rtsp_fixture_produces_real_frames(tmp_path):
     assert [event_type for event_type, _data in events][-1] == "job_done"
     assert source_url not in json.dumps(events)
     assert source_url not in Path(result.manifest_path).read_text(encoding="utf-8")
+
+
+def _require_ffmpeg() -> None:
+    if shutil.which("ffmpeg") is not None:
+        return
+    if os.environ.get("CRV_REQUIRE_FFMPEG") == "1":
+        pytest.fail("ffmpeg is required for the RTSP release-gate fixture")
+    pytest.skip("ffmpeg not installed")
+
+
+def test_release_gate_fails_when_required_ffmpeg_is_missing(monkeypatch):
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+    monkeypatch.setenv("CRV_REQUIRE_FFMPEG", "1")
+    with pytest.raises(pytest.fail.Exception, match="required for the RTSP release-gate"):
+        _require_ffmpeg()
 
 
 @contextmanager

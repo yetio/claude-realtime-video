@@ -316,8 +316,22 @@ def test_tiny_video_http_sse_e2e(manager, tmp_path):
         server.shutdown(); server.server_close()
 
 
-def test_rtsp_http_sse_route_never_echoes_source(manager, monkeypatch):
-    source = "rtsp://fixture:fixture-pass@camera/live?token=fixture-token"
+@pytest.mark.parametrize(("source", "sensitive_parts"), [
+    (
+        "rtsp://host-user:host-pass@camera.internal.example:8554/secure/live?token=hostname-token",
+        ("host-user", "host-pass", "camera.internal.example", "8554", "/secure/live", "hostname-token"),
+    ),
+    (
+        "rtsp://ipv4-user:ipv4-pass@10.24.7.9:9554/ipv4/live?token=ipv4-token",
+        ("ipv4-user", "ipv4-pass", "10.24.7.9", "9554", "/ipv4/live", "ipv4-token"),
+    ),
+    (
+        "rtsp://ipv6-user:ipv6-pass@[fd00:1234:5678::9]:10554/ipv6/live?token=ipv6-token",
+        ("ipv6-user", "ipv6-pass", "fd00:1234:5678::9", "10554", "/ipv6/live", "ipv6-token"),
+    ),
+])
+def test_rtsp_http_sse_and_status_never_echo_authority(
+        manager, monkeypatch, source, sensitive_parts):
     manager.retention_seconds = 60
 
     def fake_rtsp_process(src, out_dir, *, event_sink, **_kwargs):
@@ -345,15 +359,17 @@ def test_rtsp_http_sse_route_never_echoes_source(manager, monkeypatch):
             "opts": {"grid": False, "transcribe": False},
         })
         assert status == 200
-        assert "fixture-pass" not in json.dumps(created)
         status, _headers, body = _get(server, f"/events?id={created['id']}")
         text = body.decode()
         assert status == 200
         assert "event: stream_started" in text
         assert "event: frame_kept" in text
         assert "event: job_done" in text
-        assert "fixture-pass" not in text
-        assert "fixture-token" not in text
+        status, _headers, status_body = _get(server, f"/status?id={created['id']}")
+        assert status == 200
+        public_http = json.dumps(created) + text + status_body.decode()
+        for sensitive in (source, *sensitive_parts):
+            assert sensitive not in public_http
         payloads = [json.loads(line[6:]) for line in text.splitlines() if line.startswith("data: ")]
         started = next(payload for payload in payloads if payload["type"] == JOB_STARTED)
         assert started["payload"] == {"source_kind": "rtsp"}

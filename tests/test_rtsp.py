@@ -7,8 +7,8 @@ import subprocess
 
 import pytest
 
-from claude_real_video.cli import _resolve_source
-from claude_real_video.core import ProcessingCancelled, process
+from claude_real_video.cli import _kb_source_label, _resolve_source
+from claude_real_video.core import ProcessingCancelled, process, save_to_kb
 from claude_real_video.job_events import JOB_STARTED, JobEventBus
 from claude_real_video.rtsp import (
     RtspCaptureError,
@@ -286,8 +286,22 @@ def test_static_rtsp_chunks_remain_bounded_and_deduplicated(tmp_path):
     assert len(list(tmp_path.glob("*.jpg"))) == 3
 
 
-def test_core_process_routes_rtsp_without_persisting_source_url(tmp_path):
-    source_url, username, password = _fixture_source()
+@pytest.mark.parametrize(("source_url", "sensitive_parts"), [
+    (
+        "rtsp://host-user:host-pass@camera.internal.example:8554/secure/live?token=hostname-token",
+        ("host-user", "host-pass", "camera.internal.example", "8554", "/secure/live", "hostname-token"),
+    ),
+    (
+        "rtsp://ipv4-user:ipv4-pass@10.24.7.9:9554/ipv4/live?token=ipv4-token",
+        ("ipv4-user", "ipv4-pass", "10.24.7.9", "9554", "/ipv4/live", "ipv4-token"),
+    ),
+    (
+        "rtsp://ipv6-user:ipv6-pass@[fd00:1234:5678::9]:10554/ipv6/live?token=ipv6-token",
+        ("ipv6-user", "ipv6-pass", "fd00:1234:5678::9", "10554", "/ipv6/live", "ipv6-token"),
+    ),
+])
+def test_core_process_redacts_entire_rtsp_authority_from_public_outputs(
+        tmp_path, source_url, sensitive_parts):
     commands = []
 
     class Controller:
@@ -320,13 +334,20 @@ def test_core_process_routes_rtsp_without_persisting_source_url(tmp_path):
     assert os.path.isfile(result.frames_json_path)
     manifest = Path(result.manifest_path).read_text(encoding="utf-8")
     serialized = json.dumps(events)
-    for sensitive in (source_url, username, password, "fixture-token"):
-        assert sensitive not in manifest
-        assert sensitive not in serialized
+    kb_path = save_to_kb(
+        str(tmp_path / "kb"), result.manifest_path, _kb_source_label(source_url),
+    )
+    kb_export = Path(kb_path).read_text(encoding="utf-8")
+    parsed_source = RtspSource.parse(source_url)
+    public_outputs = (manifest, serialized, kb_export, repr(parsed_source), str(parsed_source))
+    for sensitive in (source_url, *sensitive_parts):
+        assert all(sensitive not in output for output in public_outputs)
         assert all(sensitive not in " ".join(command) for command in commands)
     assert events[0] == ("job_started", {"source_kind": "rtsp"})
     assert events[-1][0] == "job_done"
-    assert "source: rtsp://127.0.0.1:8554/<redacted>" in manifest
+    assert "source: rtsp://<redacted>" in manifest
+    assert parsed_source.redacted_url == "rtsp://<redacted>"
+    assert _kb_source_label(source_url) == "rtsp-stream-redacted"
 
 
 def test_cli_requires_private_file_for_authenticated_rtsp(tmp_path):
