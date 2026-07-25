@@ -237,6 +237,14 @@ stable. The first version is frame-only and ffmpeg-backed, with:
 RTSP is intentionally not part of M1/M2; it builds on the same event stream and
 viewer contract once those are locked.
 
+Implementation status: the first M3 increment defines a bounded frame-capture
+contract and typed stream events. RTSP credentials are placed only in a
+short-lived `0600` ffconcat input inside a `0700` temporary directory; the
+ffmpeg argv contains only that temporary path, and the directory is removed
+after success, failure or cancellation. Public events and exceptions expose
+stable codes only. CLI/web routing and reconnect orchestration remain separate
+increments and are not implied by this foundation commit.
+
 ---
 
 ## Install

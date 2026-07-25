@@ -63,6 +63,23 @@ class JobEventBusTests(unittest.TestCase):
         })
         self.assertEqual(error.payload, {"code": "RuntimeError"})
 
+    def test_rtsp_stream_events_are_allowlisted_without_source_details(self):
+        bus = JobEventBus(clock=lambda: 1.0)
+        bus.emit("rtsp", JOB_STARTED, {"source_kind": "rtsp"})
+        started = bus.emit("rtsp", "stream_started", {
+            "transport": "tcp", "attempt": 2,
+            "source": "rtsp://fixture:fixture-pass@host/live",
+        })
+        failed = bus.emit("rtsp", "stream_error", {
+            "code": "rtsp_auth_failed",
+            "stderr": "rtsp://fixture:fixture-pass@host/live",
+        })
+
+        self.assertEqual(started.payload, {"transport": "tcp", "attempt": 2})
+        self.assertEqual(failed.payload, {"code": "rtsp_auth_failed"})
+        self.assertNotIn("fixture-pass", str(started.to_dict()))
+        self.assertNotIn("fixture-pass", str(failed.to_dict()))
+
     def test_bounded_log_reports_replay_gap(self):
         bus = JobEventBus(max_events_per_job=3, clock=lambda: 1.0)
         bus.emit("job-1", JOB_STARTED)

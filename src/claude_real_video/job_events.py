@@ -6,6 +6,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from threading import Condition, RLock
 import os
+import re
 import time
 from typing import Any, Callable
 
@@ -22,10 +23,16 @@ JOB_ERROR = "job_error"
 JOB_CANCELLED = "job_cancelled"
 JOB_CLEANUP = "job_cleanup"
 REPLAY_GAP = "replay_gap"
+STREAM_STARTED = "stream_started"
+STREAM_RECONNECT = "stream_reconnect"
+STREAM_TIMEOUT = "stream_timeout"
+STREAM_DONE = "stream_done"
+STREAM_ERROR = "stream_error"
 
 EVENT_TYPES = frozenset({
     JOB_STARTED, SOURCE_READY, FRAME_KEPT, FRAME_DROPPED, JOB_LOG,
     TRANSCRIPT_SEGMENT, JOB_DONE, JOB_ERROR, JOB_CANCELLED, JOB_CLEANUP,
+    STREAM_STARTED, STREAM_RECONNECT, STREAM_TIMEOUT, STREAM_DONE, STREAM_ERROR,
 })
 TERMINAL_EVENT_TYPES = frozenset({JOB_DONE, JOB_ERROR, JOB_CANCELLED})
 
@@ -95,7 +102,8 @@ def _payload_for(event_type: str, data: dict[str, Any]) -> tuple[dict[str, Any],
     media_time = data.get("timestamp_seconds")
     media_time_ms = int(float(media_time) * 1000) if isinstance(media_time, (int, float)) else None
     if event_type == JOB_STARTED:
-        return {"source_kind": "url" if data.get("source_kind") == "url" else "file"}, None
+        source_kind = data.get("source_kind")
+        return {"source_kind": source_kind if source_kind in {"file", "url", "rtsp"} else "file"}, None
     if event_type == SOURCE_READY:
         payload = {"duration_seconds": int(data.get("duration_seconds") or 0)}
         if artifact:
@@ -129,7 +137,28 @@ def _payload_for(event_type: str, data: dict[str, Any]) -> tuple[dict[str, Any],
         return {"code": _bounded_text(data.get("error_type"), maximum=80) or "processing_failed"}, None
     if event_type == JOB_CLEANUP:
         return {"reason": _bounded_text(data.get("reason"), maximum=160) or "worker finished"}, None
+    if event_type == STREAM_STARTED:
+        return {
+            "transport": "udp" if data.get("transport") == "udp" else "tcp",
+            "attempt": max(1, int(data.get("attempt") or 1)),
+        }, None
+    if event_type == STREAM_RECONNECT:
+        return {
+            "attempt": max(1, int(data.get("attempt") or 1)),
+            "code": _stream_code(data.get("code"), "stream_reconnect"),
+        }, None
+    if event_type == STREAM_TIMEOUT:
+        return {"code": _stream_code(data.get("code"), "stream_timeout")}, None
+    if event_type == STREAM_DONE:
+        return {"frame_count": max(0, int(data.get("frame_count") or 0))}, None
+    if event_type == STREAM_ERROR:
+        return {"code": _stream_code(data.get("code"), "stream_failed")}, None
     raise ValueError(f"unknown event type: {event_type}")
+
+
+def _stream_code(value: Any, default: str) -> str:
+    code = str(value or "")
+    return code if re.fullmatch(r"[a-z0-9_]{1,80}", code) else default
 
 
 class JobEventBus:
