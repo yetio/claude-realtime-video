@@ -1,4 +1,5 @@
 """M2 source-clock and cross-window state regressions."""
+import subprocess
 import pytest
 
 from claude_real_video.stream_windows import (
@@ -10,6 +11,7 @@ from claude_real_video.stream_windows import (
     TranscriptSegment,
     WindowDeduplicator,
     WindowEventProducer,
+    emit_local_video_windows,
     segment_windows,
 )
 from claude_real_video.job_events import JOB_STARTED, JobEventBus
@@ -87,3 +89,33 @@ def test_window_event_producer_uses_the_existing_m1_event_sink_in_source_order()
     ]
     assert [event.media_time_ms for event in events[1:]] == [500, 1_000, 2_000, 3_000]
     assert events[1].payload == {"text": "opening", "end_time_ms": 1_200}
+
+
+def test_local_segment_reader_emits_real_windowed_frames_to_m1_sink(tmp_path):
+    if not _ffmpeg_available():
+        pytest.skip("ffmpeg not installed")
+    source = tmp_path / "source.mp4"
+    subprocess.run([
+        "ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=duration=3:size=160x120:rate=10",
+        "-pix_fmt", "yuv420p", str(source),
+    ], check=True, capture_output=True)
+    bus = JobEventBus(clock=lambda: 1.0)
+    bus.emit("local-window-job", JOB_STARTED)
+    out = tmp_path / "frames"
+    producer = WindowEventProducer(bus.event_sink("local-window-job"), dedup_ttl_ms=1)
+    emit_local_video_windows(
+        producer, str(source), str(out), duration_ms=3_000, window_ms=1_000,
+        sample_fps=1.0,
+    )
+    events = bus.replay("local-window-job")
+    frame_events = [event for event in events if event.type == "frame_kept"]
+    assert frame_events
+    assert [event.media_time_ms for event in frame_events] == sorted(
+        event.media_time_ms for event in frame_events)
+    assert all(0 <= event.media_time_ms < 3_000 for event in frame_events)
+    assert all((out / event.payload["artifact"]).is_file() for event in frame_events)
+
+
+def _ffmpeg_available():
+    from shutil import which
+    return bool(which("ffmpeg"))

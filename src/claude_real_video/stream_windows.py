@@ -7,8 +7,13 @@ file segment runner or the M3 RTSP runner emits M1 events.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import math
-from typing import Any, Callable, Hashable
+import os
+from pathlib import Path
+import re
+import subprocess
+from typing import Any, Callable, Hashable, Iterable
 
 
 @dataclass(frozen=True)
@@ -27,6 +32,15 @@ class SourceWindow:
     index: int
     start_ms: int
     end_ms: int
+
+
+@dataclass(frozen=True)
+class SegmentFrame:
+    """A real frame extracted from one source window on the absolute clock."""
+
+    window: SourceWindow
+    media_time_ms: int
+    path: str
 
 
 def segment_windows(duration_ms: int, *, window_ms: int) -> list[SourceWindow]:
@@ -206,6 +220,75 @@ class WindowEventProducer:
             if item.kind == "transcript_segment":
                 payload["end_seconds"] = payload.pop("end_time_ms") / 1000
             self.event_sink(item.kind, payload)
+
+
+def read_local_video_windows(video: str, out_dir: str, *, duration_ms: int,
+                             window_ms: int, sample_fps: float = 1.0,
+                             command_runner: Callable[[list[str]], subprocess.CompletedProcess[str]] | None = None
+                             ) -> Iterable[SegmentFrame]:
+    """Extract timestamped frames from a bounded local source one window at a time.
+
+    ``-ss`` makes ffmpeg's filter timestamps relative to the segment, so each
+    parsed timestamp is offset by the window start before leaving this function.
+    The injectable runner lets callers reuse their cancellation-aware process
+    controller instead of starting an unmanaged child process.
+    """
+    if sample_fps <= 0 or not math.isfinite(sample_fps):
+        raise ValueError("sample_fps must be finite and > 0")
+    runner = command_runner or _run_command
+    root = Path(out_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    for window in segment_windows(duration_ms, window_ms=window_ms):
+        pattern = root / f"window_{window.index:05d}_%05d.jpg"
+        command = [
+            "ffmpeg", "-y", "-ss", f"{window.start_ms / 1000:.3f}",
+            "-t", f"{(window.end_ms - window.start_ms) / 1000:.3f}", "-i", video,
+            "-vf", f"fps={sample_fps},showinfo,scale=640:-1", "-vsync", "vfr",
+            str(pattern), "-hide_banner", "-loglevel", "info",
+        ]
+        result = runner(command)
+        if result.returncode != 0:
+            raise RuntimeError("ffmpeg failed while reading source window")
+        paths = sorted(root.glob(f"window_{window.index:05d}_*.jpg"))
+        local_times = _showinfo_times(result.stderr)
+        if len(local_times) != len(paths):
+            local_times = [index / sample_fps for index in range(len(paths))]
+        for path, local_seconds in zip(paths, local_times):
+            media_time_ms = min(
+                window.end_ms - 1,
+                window.start_ms + max(0, round(local_seconds * 1000)),
+            )
+            yield SegmentFrame(window, media_time_ms, str(path))
+
+
+def emit_local_video_windows(producer: WindowEventProducer, video: str, out_dir: str,
+                             *, duration_ms: int, window_ms: int,
+                             sample_fps: float = 1.0,
+                             command_runner: Callable[[list[str]], subprocess.CompletedProcess[str]] | None = None
+                             ) -> None:
+    """Read local source windows and publish their deduplicated M1 frame events."""
+    root = os.path.realpath(out_dir)
+    for frame in read_local_video_windows(
+        video, root, duration_ms=duration_ms, window_ms=window_ms,
+        sample_fps=sample_fps, command_runner=command_runner,
+    ):
+        with open(frame.path, "rb") as image:
+            signature = hashlib.blake2b(image.read(), digest_size=16).digest()
+        producer.frame(signature, frame.media_time_ms, {
+            "artifact": os.path.relpath(frame.path, root).replace(os.sep, "/"),
+            "selection_reason": "window_sample",
+        })
+    producer.finish()
+
+
+def _run_command(command: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(command, capture_output=True, text=True, errors="replace")
+
+
+def _showinfo_times(stderr: str) -> list[float]:
+    return [max(0.0, float(value)) for value in re.findall(
+        r"pts_time:\s*(-?[0-9]+(?:\.[0-9]+)?)", stderr or "",
+    )]
 
 
 def _validate_time(value: int) -> None:
