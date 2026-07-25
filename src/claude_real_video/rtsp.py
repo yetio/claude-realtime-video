@@ -13,7 +13,7 @@ import stat
 import subprocess
 import tempfile
 import time
-from typing import Callable, Iterator
+from typing import Any, Callable, Iterator
 from urllib.parse import SplitResult, urlsplit
 
 from .job_events import (
@@ -154,7 +154,8 @@ def stream_rtsp_frames(producer: WindowEventProducer, source_url: str,
                        transport: str = "tcp",
                        limits: RtspLimits | None = None,
                        reconnect: RtspReconnectPolicy | None = None,
-                       sleep: Callable[[float], None] = time.sleep) -> int:
+                       sleep: Callable[[float], None] = time.sleep,
+                       monotonic: Callable[[], float] = time.monotonic) -> int:
     """Process bounded RTSP chunks with finite retries and monotonic epochs."""
     limits = limits or RtspLimits()
     reconnect = reconnect or RtspReconnectPolicy()
@@ -163,17 +164,31 @@ def stream_rtsp_frames(producer: WindowEventProducer, source_url: str,
         raise ValueError("RTSP transport must be tcp or udp")
     producer.event_sink(STREAM_STARTED, {"transport": transport, "attempt": 1})
 
-    runtime_remaining = limits.max_runtime_seconds
+    deadline = monotonic() + limits.max_runtime_seconds
+    media_runtime_remaining = limits.max_runtime_seconds
     frames_remaining = limits.max_retained_frames
     epoch_index = 0
     epoch_start_ms = 0
     reconnects = 0
     total_frames = 0
-    while runtime_remaining > 0 and frames_remaining > 0:
-        chunk_seconds = min(limits.chunk_seconds, runtime_remaining)
+    while media_runtime_remaining > 0 and frames_remaining > 0:
+        wall_seconds_remaining = deadline - monotonic()
+        if wall_seconds_remaining <= 0:
+            if total_frames == 0:
+                producer.event_sink(STREAM_TIMEOUT, {"code": "stream_timeout"})
+                raise RtspCaptureError("stream_timeout")
+            break
+        chunk_seconds = min(
+            limits.chunk_seconds,
+            media_runtime_remaining,
+            wall_seconds_remaining,
+        )
         chunk_limits = replace(
             limits,
             max_runtime_seconds=chunk_seconds,
+            read_timeout_seconds=min(
+                limits.read_timeout_seconds, wall_seconds_remaining,
+            ),
             max_retained_frames=frames_remaining,
         )
         try:
@@ -190,6 +205,11 @@ def stream_rtsp_frames(producer: WindowEventProducer, source_url: str,
         except RtspCaptureError as exc:
             if exc.code not in _RETRYABLE_CODES or reconnects >= reconnect.max_reconnects:
                 raise
+            wall_seconds_remaining = max(0.0, deadline - monotonic())
+            if wall_seconds_remaining <= reconnect.backoff_seconds:
+                if total_frames:
+                    break
+                raise
             reconnects += 1
             producer.event_sink(STREAM_RECONNECT, {
                 "attempt": reconnects + 1,
@@ -202,13 +222,93 @@ def stream_rtsp_frames(producer: WindowEventProducer, source_url: str,
 
         total_frames += captured
         frames_remaining -= captured
-        runtime_remaining -= chunk_seconds
+        media_runtime_remaining -= chunk_seconds
         epoch_start_ms += max(1, round(chunk_seconds * 1_000))
         epoch_index += 1
 
     producer.finish()
     producer.event_sink(STREAM_DONE, {"frame_count": total_frames})
     return total_frames
+
+
+def process_rtsp(source_url: str, out_dir: str, *,
+                 event_sink: Callable[[str, dict[str, Any]], None] | None = None,
+                 process_controller: Any = None,
+                 cancel_check: Callable[[], bool] | None = None,
+                 overwrite: bool = False,
+                 transport: str = "tcp",
+                 limits: RtspLimits | None = None,
+                 reconnect: RtspReconnectPolicy | None = None):
+    """Run the frame-only M3 pipeline without persisting the RTSP source URL."""
+    from .core import (
+        ProcessController,
+        ProcessingCancelled,
+        Result,
+        _prepare_out_dir,
+        write_frames_json,
+    )
+
+    source = RtspSource.parse(source_url)
+    limits = limits or RtspLimits()
+    reconnect = reconnect or RtspReconnectPolicy()
+    _prepare_out_dir(out_dir, overwrite)
+    frames_dir = os.path.join(out_dir, "frames")
+    records: list[dict[str, Any]] = []
+
+    def safe_sink(event_type: str, data: dict[str, Any]) -> None:
+        if event_type == "frame_kept" and data.get("artifact"):
+            records.append({
+                "name": os.path.basename(str(data["artifact"])),
+                "kept": True,
+                "t": float(data.get("timestamp_seconds") or 0),
+                "via": "rtsp_sample",
+            })
+        if event_sink is not None:
+            try:
+                event_sink(event_type, dict(data))
+            except Exception:
+                pass
+
+    if cancel_check is not None and cancel_check():
+        raise ProcessingCancelled("job cancelled")
+    controller = process_controller or ProcessController()
+    producer = WindowEventProducer(safe_sink)
+    extracted = stream_rtsp_frames(
+        producer, source_url, frames_dir,
+        command_runner=controller.run,
+        transport=transport,
+        limits=limits,
+        reconnect=reconnect,
+    )
+    if cancel_check is not None and cancel_check():
+        raise ProcessingCancelled("job cancelled")
+
+    frames_json = write_frames_json(out_dir, records)
+    manifest = os.path.join(out_dir, "MANIFEST.txt")
+    transcript_note = "(skipped: RTSP M3 is frame-only)"
+    with open(manifest, "w", encoding="utf-8") as output:
+        output.write(
+            f"source: {source.redacted_url}\n"
+            f"mode: bounded RTSP frame-only intake ({transport})\n"
+            f"duration budget: {limits.max_runtime_seconds:.3f}s\n"
+            f"frames: {len(records)} kept from {extracted} sampled\n"
+            f"frames dir: {frames_dir}\n"
+            f"transcript: {transcript_note}\n"
+        )
+        if frames_json:
+            output.write("frame timestamps: frames.json\n")
+    return Result(
+        out_dir=out_dir,
+        video="",
+        duration=max(1, round(limits.max_runtime_seconds)),
+        frames_dir=frames_dir,
+        frame_count=len(records),
+        extracted_frames=extracted,
+        transcript_path=None,
+        manifest_path=manifest,
+        transcript_note=transcript_note,
+        frames_json_path=frames_json,
+    )
 
 
 def _capture_rtsp_epoch(producer: WindowEventProducer, source_url: str,

@@ -1,7 +1,11 @@
 """Command-line interface for claude-real-video."""
+from __future__ import annotations
+
 import argparse
 import os
+import stat
 import sys
+from urllib.parse import urlsplit
 
 from .core import process
 
@@ -21,7 +25,7 @@ def main() -> None:
         description="Let Claude (or any LLM) actually watch a video: scene-aware, "
                     "deduplicated frames + a transcript, from a URL or a local file.",
     )
-    ap.add_argument("source", help="Video URL (YouTube, Instagram, ...) or a local file path")
+    ap.add_argument("source", nargs="?", help="Video/unauthenticated RTSP URL or a local file path")
     ap.add_argument("-o", "--out", default="crv-out", help="Output directory (default: ./crv-out)")
     ap.add_argument("--overwrite", action="store_true",
                     help="Replace a previous analysis living in the output directory "
@@ -92,11 +96,28 @@ def main() -> None:
     ap.add_argument("--keep-audio", action="store_true",
                     help="Also save the full original soundtrack (music + speech) as audio.m4a, "
                          "for models that can listen to audio (Gemini, GPT-4o, ...)")
+    ap.add_argument("--rtsp-transport", choices=["tcp", "udp"], default="tcp",
+                    help="RTSP transport (default: tcp)")
+    ap.add_argument("--rtsp-runtime", type=float, default=30.0, metavar="SECONDS",
+                    help="RTSP total capture budget (default: 30s)")
+    ap.add_argument("--rtsp-chunk", type=float, default=5.0, metavar="SECONDS",
+                    help="RTSP capture chunk size (default: 5s)")
+    ap.add_argument("--rtsp-read-timeout", type=float, default=5.0, metavar="SECONDS",
+                    help="RTSP socket read timeout (default: 5s)")
+    ap.add_argument("--rtsp-frames-per-minute", type=int, default=60,
+                    help="RTSP sampling ceiling (default: 60/min)")
+    ap.add_argument("--rtsp-max-frames", type=int, default=120,
+                    help="RTSP retained artifact ceiling (default: 120)")
+    ap.add_argument("--rtsp-reconnects", type=int, default=2,
+                    help="RTSP retry ceiling for transient failures (default: 2)")
+    ap.add_argument("--rtsp-source-file", metavar="FILE",
+                    help="read an authenticated RTSP URL from a private 0600 file")
     args = ap.parse_args()
 
     try:
+        source = _resolve_source(args.source, args.rtsp_source_file)
         r = process(
-            args.source, args.out,
+            source, args.out,
             scene=args.scene, adaptive=args.adaptive, text_anchors=args.text_anchors,
             fps_floor=args.fps_floor, max_frames=args.max_frames,
             lang=args.lang, cookies=args.cookies, cookies_from_browser=args.cookies_from_browser,
@@ -105,6 +126,13 @@ def main() -> None:
             dedup_window=args.dedup_window, keep_audio=args.keep_audio, report=args.report,
             why=args.why, overwrite=args.overwrite, speakers=args.speakers,
             export=args.export,
+            rtsp_transport=args.rtsp_transport,
+            rtsp_max_runtime_seconds=args.rtsp_runtime,
+            rtsp_chunk_seconds=args.rtsp_chunk,
+            rtsp_read_timeout_seconds=args.rtsp_read_timeout,
+            rtsp_frames_per_minute=args.rtsp_frames_per_minute,
+            rtsp_max_retained_frames=args.rtsp_max_frames,
+            rtsp_max_reconnects=args.rtsp_reconnects,
         )
     except Exception as e:  # noqa: BLE001 — surface a clean message to the user
         print(f"error: {e}", file=sys.stderr)
@@ -118,7 +146,7 @@ def main() -> None:
     if args.viewer:
         from .viewer import write_viewer
         vsrc = os.path.join(r.out_dir, "source.mp4")
-        vp = write_viewer(r.out_dir, vsrc if os.path.exists(vsrc) else (args.source if os.path.exists(args.source) else None))
+        vp = write_viewer(r.out_dir, vsrc if os.path.exists(vsrc) else (source if os.path.exists(source) else None))
         print(f"  viewer:     {vp}  (double-click to open)")
     if r.report_path:
         print(f"  report:     {r.report_path}  (open in a browser to tune the threshold)")
@@ -134,7 +162,8 @@ def main() -> None:
         print(f"  grids:      {len(sheets)} contact sheet(s) in {r.out_dir}/grids")
     if args.kb:
         from .core import save_to_kb
-        dest = save_to_kb(args.kb, r.manifest_path, args.source)
+        kb_source = "rtsp-stream-redacted" if source.lower().startswith("rtsp://") else source
+        dest = save_to_kb(args.kb, r.manifest_path, kb_source)
         print(f"  knowledge base: {dest}")
     # one quiet pointer, opt out with CRV_NO_HINT=1
     if not os.environ.get("CRV_NO_HINT"):
@@ -148,6 +177,30 @@ def main() -> None:
             print("              and builds a clickable timeline → https://leoaido.com/crv-pro/  ($19 founder price until Jul 31, then $29)")
         else:
             print("  pro:        camera-motion + voice-emotion analysis → https://leoaido.com/crv-pro/")
+
+
+def _resolve_source(source: str | None, rtsp_source_file: str | None) -> str:
+    if rtsp_source_file:
+        if source:
+            raise ValueError("use either source or --rtsp-source-file, not both")
+        file_stat = os.stat(rtsp_source_file)
+        if os.name == "posix" and stat.S_IMODE(file_stat.st_mode) & 0o077:
+            raise ValueError("RTSP source file must be private (chmod 600)")
+        with open(rtsp_source_file, encoding="utf-8") as source_file:
+            value = source_file.read(8_193)
+        if len(value) > 8_192:
+            raise ValueError("RTSP source file is too large")
+        value = value.strip()
+        if not value.lower().startswith("rtsp://"):
+            raise ValueError("RTSP source file must contain an rtsp:// URL")
+        return value
+    if not source:
+        raise ValueError("source is required")
+    if source.lower().startswith("rtsp://"):
+        parts = urlsplit(source)
+        if parts.username is not None or parts.password is not None:
+            raise ValueError("authenticated RTSP URLs must use --rtsp-source-file")
+    return source
 
 
 if __name__ == "__main__":

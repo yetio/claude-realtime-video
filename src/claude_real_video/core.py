@@ -92,6 +92,15 @@ class ProcessController:
                     raise ProcessingCancelled("job cancelled")
             stdout, stderr = proc.communicate()
             return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+        except BaseException:
+            if proc.poll() is None:
+                self._stop_group(proc)
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    self._kill_group(proc)
+                    proc.wait(timeout=2)
+            raise
         finally:
             with self._lock:
                 if self._active is proc:
@@ -1072,7 +1081,14 @@ def process(src: str, out_dir: str, *, scene: float = 0.30, fps_floor: float = 1
             overwrite: bool = False, speakers: bool = False,
             export: str | None = None, event_sink: EventSink | None = None,
             cancel_check: CancelCheck | None = None,
-            process_controller: ProcessController | None = None) -> Result:
+            process_controller: ProcessController | None = None,
+            rtsp_transport: str = "tcp",
+            rtsp_max_runtime_seconds: float = 30.0,
+            rtsp_chunk_seconds: float = 5.0,
+            rtsp_read_timeout_seconds: float = 5.0,
+            rtsp_frames_per_minute: int = 60,
+            rtsp_max_retained_frames: int = 120,
+            rtsp_max_reconnects: int = 2) -> Result:
     """Run the batch pipeline, optionally mirroring milestones to ``event_sink``.
 
     The sink receives ``(event_type, JSON-serializable data)``. It is an
@@ -1081,23 +1097,49 @@ def process(src: str, out_dir: str, *, scene: float = 0.30, fps_floor: float = 1
     """
     token = _ACTIVE_PROCESS_CONTROLLER.set(process_controller) if process_controller else None
     try:
-        _emit_event(event_sink, JOB_STARTED, {"source_kind": "url" if src.startswith(("http://", "https://")) else "file"})
+        is_rtsp = src.lower().startswith("rtsp://")
+        source_kind = "rtsp" if is_rtsp else ("url" if src.startswith(("http://", "https://")) else "file")
+        _emit_event(event_sink, JOB_STARTED, {"source_kind": source_kind})
         try:
-            result = _process(
-                src, out_dir,
-                scene=scene, fps_floor=fps_floor, adaptive=adaptive,
-                text_anchors=text_anchors, max_frames=max_frames, lang=lang,
-                cookies=cookies, do_transcribe=do_transcribe,
-                dedup_threshold=dedup_threshold, dedup_window=dedup_window,
-                keep_audio=keep_audio, report=report, why=why,
-                whisper_model=whisper_model, cookies_from_browser=cookies_from_browser,
-                overwrite=overwrite, speakers=speakers, export=export,
-                event_sink=event_sink, cancel_check=cancel_check,
-            )
+            if is_rtsp:
+                from .rtsp import (
+                    RtspLimits,
+                    RtspReconnectPolicy,
+                    process_rtsp,
+                )
+                result = process_rtsp(
+                    src, out_dir,
+                    event_sink=event_sink,
+                    process_controller=process_controller,
+                    cancel_check=cancel_check,
+                    overwrite=overwrite,
+                    transport=rtsp_transport,
+                    limits=RtspLimits(
+                        max_runtime_seconds=rtsp_max_runtime_seconds,
+                        chunk_seconds=rtsp_chunk_seconds,
+                        read_timeout_seconds=rtsp_read_timeout_seconds,
+                        max_frames_per_minute=rtsp_frames_per_minute,
+                        max_retained_frames=rtsp_max_retained_frames,
+                    ),
+                    reconnect=RtspReconnectPolicy(max_reconnects=rtsp_max_reconnects),
+                )
+            else:
+                result = _process(
+                    src, out_dir,
+                    scene=scene, fps_floor=fps_floor, adaptive=adaptive,
+                    text_anchors=text_anchors, max_frames=max_frames, lang=lang,
+                    cookies=cookies, do_transcribe=do_transcribe,
+                    dedup_threshold=dedup_threshold, dedup_window=dedup_window,
+                    keep_audio=keep_audio, report=report, why=why,
+                    whisper_model=whisper_model, cookies_from_browser=cookies_from_browser,
+                    overwrite=overwrite, speakers=speakers, export=export,
+                    event_sink=event_sink, cancel_check=cancel_check,
+                )
         except ProcessingCancelled:
             raise
         except Exception as exc:
-            _emit_event(event_sink, JOB_ERROR, {"error_type": type(exc).__name__, "message": str(exc)})
+            error_type = str(getattr(exc, "code", type(exc).__name__))
+            _emit_event(event_sink, JOB_ERROR, {"error_type": error_type, "message": str(exc)})
             raise
         _emit_event(event_sink, JOB_DONE, {
             "frame_count": result.frame_count,

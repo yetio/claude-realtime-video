@@ -16,6 +16,7 @@ from claude_real_video import serve
 from claude_real_video.core import ProcessController, ProcessingCancelled
 from claude_real_video.job_events import JOB_CANCELLED, JOB_CLEANUP, JOB_DONE, JOB_LOG, JOB_STARTED, SOURCE_READY
 from claude_real_video.job_manager import JobManager
+from claude_real_video.rtsp import RtspCaptureError
 
 
 @pytest.fixture
@@ -130,6 +131,22 @@ def test_worker_owns_terminal_during_cancel_done_race(manager, monkeypatch):
     assert [event.type for event in events] == [JOB_STARTED, JOB_LOG, JOB_CANCELLED, JOB_CLEANUP]
 
 
+def test_rtsp_source_kind_and_worker_error_code_are_stable(manager, monkeypatch):
+    assert serve._source_kind("rtsp://fixture:fixture-pass@camera/live") == "rtsp"
+    job = _started_job(manager, "rtsp")
+
+    def fail_rtsp(*_args, **_kwargs):
+        raise RtspCaptureError("stream_timeout")
+
+    monkeypatch.setattr(serve, "process", fail_rtsp)
+    serve._run_job(job.job_id, "rtsp://fixture:fixture-pass@camera/live", {})
+    events = job.bus.replay(job.job_id)
+    assert job.error_code == "stream_timeout"
+    assert [event.type for event in events] == [JOB_STARTED, "job_error", JOB_CLEANUP]
+    assert "fixture-pass" not in json.dumps([event.to_dict() for event in events])
+    assert "document.getElementById('src').value=''" in serve.PAGE
+
+
 def test_cancellation_wins_after_worker_preterminal_check(manager):
     """Lock the exact window: cancel lands after worker's last check, before done."""
     job = _started_job(manager)
@@ -217,6 +234,33 @@ def test_cancellable_process_group_leaves_no_child(tmp_path):
         time.sleep(0.05)
     else:
         pytest.fail(f"orphan child process remains: {child_pid}")
+
+
+def test_process_controller_interrupt_leaves_no_child(tmp_path):
+    pid_file = tmp_path / "interrupt-child.pid"
+    script = (
+        f"open({str(pid_file)!r}, 'w').write(str(__import__('os').getpid()))\n"
+        "import time; time.sleep(30)\n"
+    )
+
+    class InterruptEvent:
+        @staticmethod
+        def is_set():
+            return False
+
+        @staticmethod
+        def wait(_timeout):
+            time.sleep(0.1)
+            raise KeyboardInterrupt
+
+    controller = ProcessController()
+    controller.cancel_event = InterruptEvent()
+    with pytest.raises(KeyboardInterrupt):
+        controller.run([sys.executable, "-c", script])
+    assert pid_file.exists()
+    child_pid = int(pid_file.read_text())
+    assert not _process_exists(child_pid)
+    assert controller._active is None
 
 
 def test_manager_bounds_ids_clients_retention_and_quota(tmp_path):

@@ -21,6 +21,7 @@ from .job_events import (
     JOB_DONE, JOB_ERROR, JOB_LOG, JOB_STARTED, JobEvent,
 )
 from .job_manager import JobManager
+from .rtsp import RtspCaptureError
 from .viewer import write_viewer
 
 MANAGER = JobManager()
@@ -157,6 +158,7 @@ f.addEventListener('submit', async e=>{
   e.preventDefault();
   const src=document.getElementById('src').value.trim();
   if(!src) return;
+  if(src.toLowerCase().startsWith('rtsp://')) document.getElementById('src').value='';
   go.disabled=true; go.textContent=T.running; done.style.display='none'; cancel.style.display='inline-block';
   log.style.display='block'; log.textContent=T.starting;
   frames.replaceChildren(); frames.style.display='none';
@@ -221,6 +223,8 @@ def _run_job(jid: str, src: str, opts: dict) -> None:
         MANAGER.terminal(job, JOB_ERROR, {"error_type": "job_disk_quota_exceeded"})
     except ProcessingCancelled:
         MANAGER.terminal(job, "job_cancelled", {"reason": "user requested"})
+    except RtspCaptureError as exc:
+        MANAGER.terminal(job, JOB_ERROR, {"error_type": exc.code})
     except Exception as exc:  # The public payload is redacted by JobEventBus.
         if job.cancel_event.is_set():
             MANAGER.terminal(job, "job_cancelled", {"reason": "user requested"})
@@ -396,10 +400,16 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             job = MANAGER.create()
         except RuntimeError as exc:
             return self._json({"error": str(exc)}, 429)
-        MANAGER.start(job, "url" if src.startswith(("http://", "https://")) else "file")
+        MANAGER.start(job, _source_kind(src))
         threading.Thread(target=_run_job, args=(job.job_id, src, data.get("opts") or {}),
                          daemon=True).start()
         self._json({"id": job.job_id})
+
+
+def _source_kind(src: str) -> str:
+    if src.lower().startswith("rtsp://"):
+        return "rtsp"
+    return "url" if src.startswith(("http://", "https://")) else "file"
 
 
 def main() -> None:

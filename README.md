@@ -237,13 +237,29 @@ stable. The first version is frame-only and ffmpeg-backed, with:
 RTSP is intentionally not part of M1/M2; it builds on the same event stream and
 viewer contract once those are locked.
 
-Implementation status: the first M3 increment defines a bounded frame-capture
-contract and typed stream events. RTSP credentials are placed only in a
+Implementation status: M3 now routes `rtsp://` sources through the bounded
+frame-only pipeline in both CLI and the local web worker. RTSP credentials are
+placed only in a
 short-lived `0600` ffconcat input inside a `0700` temporary directory; the
 ffmpeg argv contains only that temporary path, and the directory is removed
 after success, failure or cancellation. Public events and exceptions expose
-stable codes only. CLI/web routing and reconnect orchestration remain separate
-increments and are not implied by this foundation commit.
+stable codes only. Capture runs in finite chunks, retries transient failures
+within a hard ceiling, resets the M2 source epoch on reconnect, and keeps
+authentication/unsupported-codec failures non-retryable. The dedicated review
+evidence is in `docs/M3_RTSP_SECURITY_EVIDENCE.md`.
+
+For an authenticated CLI source, keep the URL in a private file rather than in
+the shell command:
+
+```bash
+chmod 600 /path/to/rtsp-source.txt
+crv --rtsp-source-file /path/to/rtsp-source.txt -o crv-rtsp-out
+```
+
+Putting credentials directly in the positional argument is rejected because it
+would expose them through the parent process argv and shell history. The local
+web form accepts the URL in memory, clears the field on submit, suppresses
+request logs and never echoes the source in responses or events.
 
 ---
 

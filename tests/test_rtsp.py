@@ -7,7 +7,8 @@ import subprocess
 
 import pytest
 
-from claude_real_video.core import ProcessingCancelled
+from claude_real_video.cli import _resolve_source
+from claude_real_video.core import ProcessingCancelled, process
 from claude_real_video.job_events import JOB_STARTED, JobEventBus
 from claude_real_video.rtsp import (
     RtspCaptureError,
@@ -185,6 +186,47 @@ def test_rtsp_stream_reconnects_retryable_failure_and_resets_epoch(tmp_path):
     assert password not in serialized
 
 
+def test_rtsp_retries_and_backoff_share_the_total_wall_clock_budget(tmp_path):
+    source_url, _username, _password = _fixture_source()
+    now = [0.0]
+    calls = []
+
+    def runner(command):
+        calls.append(list(command))
+        now[0] += float(command[command.index("-t") + 1])
+        return subprocess.CompletedProcess(command, 1, "", "Connection timed out")
+
+    def sleep(seconds):
+        now[0] += seconds
+
+    bus = JobEventBus(clock=lambda: 1.0)
+    bus.emit("rtsp-deadline", JOB_STARTED, {"source_kind": "rtsp"})
+    producer = WindowEventProducer(bus.event_sink("rtsp-deadline"))
+    with pytest.raises(RtspCaptureError, match="^stream_timeout$"):
+        stream_rtsp_frames(
+            producer, source_url, str(tmp_path), command_runner=runner,
+            limits=RtspLimits(
+                max_runtime_seconds=2, chunk_seconds=1,
+                read_timeout_seconds=5, max_frames_per_minute=60,
+                max_retained_frames=10,
+            ),
+            reconnect=RtspReconnectPolicy(max_reconnects=5, backoff_seconds=0.5),
+            sleep=sleep,
+            monotonic=lambda: now[0],
+        )
+
+    assert len(calls) == 2
+    assert [command[command.index("-t") + 1] for command in calls] == ["1.000", "0.500"]
+    assert [command[command.index("-rw_timeout") + 1] for command in calls] == [
+        "2000000", "500000",
+    ]
+    assert now[0] == 2.0
+    assert [event.type for event in bus.replay("rtsp-deadline")] == [
+        "job_started", "stream_started", "stream_timeout", "stream_reconnect",
+        "stream_timeout",
+    ]
+
+
 def test_rtsp_stream_does_not_retry_auth_or_unsupported_codec(tmp_path):
     source_url, _username, _password = _fixture_source()
     for stderr, expected in (
@@ -241,6 +283,65 @@ def test_static_rtsp_chunks_remain_bounded_and_deduplicated(tmp_path):
     dropped = next(event for event in events if event.type == "frame_dropped")
     assert dropped.payload["count"] == 2
     assert len(list(tmp_path.glob("*.jpg"))) == 3
+
+
+def test_core_process_routes_rtsp_without_persisting_source_url(tmp_path):
+    source_url, username, password = _fixture_source()
+    commands = []
+
+    class Controller:
+        def run(self, command):
+            commands.append(list(command))
+            pattern = next(value for value in command if "%05d.jpg" in value)
+            Path(pattern.replace("%05d", "00001")).write_bytes(
+                f"frame-{len(commands)}".encode(),
+            )
+            return subprocess.CompletedProcess(command, 0, "", "pts_time:0.100")
+
+    events = []
+    out = tmp_path / "analysis"
+    result = process(
+        source_url, str(out),
+        event_sink=lambda event_type, data: events.append((event_type, data)),
+        process_controller=Controller(),
+        rtsp_max_runtime_seconds=2,
+        rtsp_chunk_seconds=1,
+        rtsp_read_timeout_seconds=1,
+        rtsp_frames_per_minute=60,
+        rtsp_max_retained_frames=2,
+        rtsp_max_reconnects=0,
+    )
+
+    assert result.frame_count == 2
+    assert result.extracted_frames == 2
+    assert result.video == ""
+    assert result.transcript_path is None
+    assert os.path.isfile(result.frames_json_path)
+    manifest = Path(result.manifest_path).read_text(encoding="utf-8")
+    serialized = json.dumps(events)
+    for sensitive in (source_url, username, password, "fixture-token"):
+        assert sensitive not in manifest
+        assert sensitive not in serialized
+        assert all(sensitive not in " ".join(command) for command in commands)
+    assert events[0] == ("job_started", {"source_kind": "rtsp"})
+    assert events[-1][0] == "job_done"
+    assert "source: rtsp://127.0.0.1:8554/<redacted>" in manifest
+
+
+def test_cli_requires_private_file_for_authenticated_rtsp(tmp_path):
+    source_url, _username, _password = _fixture_source()
+    with pytest.raises(ValueError, match="must use --rtsp-source-file"):
+        _resolve_source(source_url, None)
+
+    source_file = tmp_path / "rtsp-source.txt"
+    source_file.write_text(source_url, encoding="utf-8")
+    if os.name == "posix":
+        os.chmod(source_file, 0o644)
+        with pytest.raises(ValueError, match="chmod 600"):
+            _resolve_source(None, str(source_file))
+        os.chmod(source_file, 0o600)
+    assert _resolve_source(None, str(source_file)) == source_url
+    assert _resolve_source("rtsp://127.0.0.1/live", None) == "rtsp://127.0.0.1/live"
 
 
 def _fixture_source():
