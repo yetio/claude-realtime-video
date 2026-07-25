@@ -295,7 +295,12 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                     for event in replay.events:
                         self._write_sse_event(event)
                         since = event.seq
-                    if bus.is_terminal(jid):
+                    # The terminal event can be appended after wait_for_events()
+                    # returns but before this check. Do not close until it was
+                    # sent, while still allowing replay clients that only receive
+                    # the later cleanup marker to finish immediately.
+                    if (any(event.is_terminal for event in replay.events)
+                            or (bus.is_terminal(jid) and since >= bus.last_seq(jid))):
                         return
                 elif bus.is_terminal(jid):
                     return
