@@ -10,7 +10,9 @@ review. It does not claim release approval.
 - The user-provided RTSP URL is parsed in memory and is never written to the
   manifest, frames index, viewer, public event payload, or exception text.
 - Authenticated sources are passed to ffmpeg through a temporary ffconcat file.
-  Its directory is mode `0700`; the file is mode `0600`.
+  On POSIX its directory is mode `0700` and the file is mode `0600`; on
+  Windows the file inherits the current user's protected temporary-directory
+  ACL because POSIX mode bits do not express Windows access control.
 - The temporary directory is removed after success, ffmpeg failure, or
   `ProcessingCancelled`.
 
@@ -21,8 +23,9 @@ review. It does not claim release approval.
 - The RTSP URL, username, password and query string are absent from argv.
 - An authenticated URL is also forbidden in the CLI positional argument,
   because that would expose it in the parent process argv and shell history.
-  Authenticated CLI use must pass `--rtsp-source-file` pointing to a mode `0600`
-  file. Unauthenticated `rtsp://` URLs may remain positional.
+  Authenticated CLI use must pass `--rtsp-source-file`; on POSIX it must be a
+  mode `0600` file, while Windows relies on the file's user ACL. Unauthenticated
+  `rtsp://` URLs may remain positional.
 - `-nostdin` is always set. The caller must supply a `ProcessController.run`
   compatible runner so cancellation terminates and waits for the process group.
 

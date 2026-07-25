@@ -240,7 +240,8 @@ viewer contract once those are locked.
 Implementation status: M3 now routes `rtsp://` sources through the bounded
 frame-only pipeline in both CLI and the local web worker. RTSP credentials are
 placed only in a
-short-lived `0600` ffconcat input inside a `0700` temporary directory; the
+short-lived ffconcat input (POSIX: `0600` inside a `0700` directory; Windows:
+the current user's protected temporary-directory ACL); the
 ffmpeg argv contains only that temporary path, and the directory is removed
 after success, failure or cancellation. Public events and exceptions expose
 stable codes only. Capture runs in finite chunks, retries transient failures

@@ -58,7 +58,8 @@ def test_rtsp_capture_keeps_credentials_out_of_argv_events_and_repr(tmp_path):
     assert observed["command"][observed["command"].index("-rw_timeout") + 1] == "1000000"
     assert observed["command"][observed["command"].index("-frames:v") + 1] == "2"
     assert observed["command"][observed["command"].index("-t") + 1] == "2.000"
-    assert observed["mode"] == 0o600
+    if os.name == "posix":
+        assert observed["mode"] == 0o600
     assert source_url in observed["config"]
     assert "option rtsp_transport tcp" in observed["config"]
     assert "option timeout 1000000" in observed["config"]
