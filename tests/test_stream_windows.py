@@ -2,11 +2,14 @@
 import pytest
 
 from claude_real_video.stream_windows import (
+    SegmentRunner,
+    SourceWindow,
     SourceWatermark,
     TimedEvidence,
     TranscriptReconciler,
     TranscriptSegment,
     WindowDeduplicator,
+    segment_windows,
 )
 
 
@@ -44,3 +47,22 @@ def test_window_state_rejects_invalid_source_times():
         SourceWatermark().add(TimedEvidence(-1, "frame", {}))
     with pytest.raises(ValueError):
         WindowDeduplicator(ttl_ms=1).keep("x", True)
+
+
+def test_segment_runner_splits_source_and_emits_monotonic_cross_window_evidence():
+    assert segment_windows(5_000, window_ms=2_000) == [
+        # Source windows are half-open: [0, 2000), [2000, 4000), [4000, 5000).
+        SourceWindow(0, 0, 2_000),
+        SourceWindow(1, 2_000, 4_000),
+        SourceWindow(2, 4_000, 5_000),
+    ]
+    runner = SegmentRunner(allowed_lateness_ms=1_000, dedup_ttl_ms=3_000)
+    assert runner.frame("scene-a", 1_000, {"artifact": "frames/a.jpg"}) == []
+    emitted = runner.transcript(TranscriptSegment(500, 1_200, "opening"))
+    emitted += runner.frame("scene-a", 2_000, {"artifact": "frames/a-duplicate.jpg"})
+    emitted += runner.frame("scene-b", 3_000, {"artifact": "frames/b.jpg"})
+    emitted += runner.finish()
+    assert [event.media_time_ms for event in emitted] == sorted(event.media_time_ms for event in emitted)
+    assert [event.kind for event in emitted] == [
+        "transcript_segment", "frame_kept", "frame_dropped", "frame_kept",
+    ]

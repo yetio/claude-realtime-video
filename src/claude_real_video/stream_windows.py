@@ -20,6 +20,26 @@ class TimedEvidence:
     payload: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class SourceWindow:
+    """One half-open slice of a bounded source timeline."""
+
+    index: int
+    start_ms: int
+    end_ms: int
+
+
+def segment_windows(duration_ms: int, *, window_ms: int) -> list[SourceWindow]:
+    """Split a finite source into contiguous half-open processing windows."""
+    _validate_time(duration_ms)
+    if window_ms <= 0:
+        raise ValueError("window_ms must be > 0")
+    return [
+        SourceWindow(index, start, min(start + window_ms, duration_ms))
+        for index, start in enumerate(range(0, duration_ms, window_ms))
+    ]
+
+
 class SourceWatermark:
     """Release ordered evidence once it is outside the lateness allowance."""
 
@@ -115,6 +135,40 @@ class TranscriptReconciler:
             self._seen.add(key)
             unique.append(TranscriptSegment(segment.start_ms, segment.end_ms, key[2]))
         return sorted(unique, key=lambda segment: (segment.start_ms, segment.end_ms, segment.text))
+
+
+class SegmentRunner:
+    """Normalize frame/transcript producers onto one watermark-controlled stream.
+
+    The caller can process each ``SourceWindow`` independently, then submit
+    evidence here.  Returned events are safe to hand to the M1 event sink in
+    order; late evidence is discarded and repeated frame signatures become a
+    regular ``frame_dropped`` event until their TTL expires.
+    """
+
+    def __init__(self, *, allowed_lateness_ms: int = 0,
+                 dedup_ttl_ms: int = 5_000) -> None:
+        self.clock = SourceWatermark(allowed_lateness_ms=allowed_lateness_ms)
+        self.dedup = WindowDeduplicator(ttl_ms=dedup_ttl_ms)
+        self.transcripts = TranscriptReconciler()
+
+    def frame(self, signature: Hashable, media_time_ms: int,
+              payload: dict[str, Any] | None = None) -> list[TimedEvidence]:
+        event_type = "frame_kept" if self.dedup.keep(signature, media_time_ms) else "frame_dropped"
+        return self.clock.add(TimedEvidence(media_time_ms, event_type, dict(payload or {})))
+
+    def transcript(self, segment: TranscriptSegment) -> list[TimedEvidence]:
+        reconciled = self.transcripts.reconcile([segment])
+        if not reconciled:
+            return []
+        item = reconciled[0]
+        return self.clock.add(TimedEvidence(item.start_ms, "transcript_segment", {
+            "end_time_ms": item.end_ms,
+            "text": item.text,
+        }))
+
+    def finish(self) -> list[TimedEvidence]:
+        return self.clock.finish()
 
 
 def _validate_time(value: int) -> None:
