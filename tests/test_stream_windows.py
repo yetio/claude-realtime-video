@@ -13,11 +13,14 @@ from claude_real_video.stream_windows import (
     TranscriptSegment,
     WindowDeduplicator,
     WindowEventProducer,
+    WindowStateOverflow,
     emit_local_media_windows,
     emit_local_video_windows,
     emit_progressive_video_update,
+    read_local_video_windows,
     segment_windows,
 )
+from claude_real_video.core import ProcessController
 from claude_real_video.job_events import JOB_STARTED, JobEventBus
 
 
@@ -34,6 +37,67 @@ def test_cross_window_dedup_releases_an_unchanged_frame_after_ttl():
     assert dedup.keep("static-camera", 0)
     assert not dedup.keep("static-camera", 4_999)
     assert dedup.keep("static-camera", 5_000)
+
+
+def test_late_frame_never_pollutes_dedup_and_lateness_releases_in_source_order():
+    runner = SegmentRunner(allowed_lateness_ms=0, dedup_ttl_ms=5_000)
+    assert [(item.media_time_ms, item.kind) for item in runner.frame("first", 10_000)] == [
+        (10_000, "frame_kept"),
+    ]
+    assert runner.frame("late-signature", 8_000) == []
+    assert [(item.media_time_ms, item.kind)
+            for item in runner.frame("late-signature", 12_000)] == [
+        (12_000, "frame_kept"),
+    ]
+
+    runner = SegmentRunner(allowed_lateness_ms=1_000, dedup_ttl_ms=5_000)
+    assert runner.frame("same", 3_000) == []
+    assert runner.frame("same", 2_500) == []
+    assert [(item.media_time_ms, item.kind) for item in runner.frame("other", 4_000)] == [
+        (2_500, "frame_kept"),
+        (3_000, "frame_dropped"),
+    ]
+
+
+def test_window_state_has_hard_capacity_and_reset_epoch_contract():
+    clock = SourceWatermark(
+        allowed_lateness_ms=10_000, max_pending=2, max_pending_bytes=10_000,
+    )
+    assert clock.add(TimedEvidence(100, "frame", {})) == []
+    assert clock.add(TimedEvidence(200, "frame", {})) == []
+    with pytest.raises(WindowStateOverflow, match="pending evidence capacity"):
+        clock.add(TimedEvidence(300, "frame", {}))
+    assert clock.pending_count == 2
+
+    dedup = WindowDeduplicator(ttl_ms=10_000, max_signatures=2)
+    assert dedup.keep("a", 100)
+    assert dedup.keep("b", 200)
+    with pytest.raises(WindowStateOverflow, match="signature capacity"):
+        dedup.keep("c", 300)
+    assert dedup.signature_count == 2
+
+    runner = SegmentRunner(allowed_lateness_ms=0, dedup_ttl_ms=10_000)
+    assert runner.frame("same", 1_000)[0].kind == "frame_kept"
+    with pytest.raises(ValueError, match="cannot move behind"):
+        runner.reset_epoch(999)
+    runner.reset_epoch(1_000)
+    assert runner.frame("same", 1_000)[0].kind == "frame_kept"
+
+
+def test_transcript_source_id_handles_retry_jitter_without_merging_real_repeats():
+    reconciler = TranscriptReconciler(max_keys=3)
+    assert reconciler.reconcile([
+        TranscriptSegment(1_000, 2_000, "hello", "segment-1"),
+    ])
+    assert reconciler.reconcile([
+        TranscriptSegment(1_010, 2_010, "hello", "segment-1"),
+    ]) == []
+    assert len(reconciler.reconcile([
+        TranscriptSegment(3_000, 4_000, "hello"),
+        TranscriptSegment(5_000, 6_000, "hello"),
+    ])) == 2
+    with pytest.raises(WindowStateOverflow, match="transcript idempotency"):
+        reconciler.reconcile([TranscriptSegment(7_000, 8_000, "new")])
 
 
 def test_transcript_reconciliation_removes_window_overlap_and_sorts():
@@ -106,6 +170,24 @@ def test_window_event_producer_uses_the_existing_m1_event_sink_in_source_order()
     assert events[1].payload == {"text": "opening", "end_time_ms": 1_200}
 
 
+def test_window_event_producer_reset_discards_old_pending_epoch():
+    bus = JobEventBus(clock=lambda: 1.0)
+    bus.emit("reset-job", JOB_STARTED)
+    producer = WindowEventProducer(
+        bus.event_sink("reset-job"), allowed_lateness_ms=1_000,
+        dedup_ttl_ms=5_000,
+    )
+    producer.frame("same", 2_000, {"artifact": "old.jpg"})
+    producer.reset_epoch(2_000)
+    producer.frame("same", 2_000, {"artifact": "new.jpg"})
+    producer.frame("other", 3_000, {"artifact": "other.jpg"})
+    producer.finish()
+
+    frames = [event for event in bus.replay("reset-job") if event.type == "frame_kept"]
+    assert [event.payload["artifact"] for event in frames] == ["new.jpg", "other.jpg"]
+    assert [event.media_time_ms for event in frames] == [2_000, 3_000]
+
+
 def test_local_segment_reader_emits_real_windowed_frames_to_m1_sink(tmp_path):
     if not _ffmpeg_available():
         pytest.skip("ffmpeg not installed")
@@ -120,7 +202,7 @@ def test_local_segment_reader_emits_real_windowed_frames_to_m1_sink(tmp_path):
     producer = WindowEventProducer(bus.event_sink("local-window-job"), dedup_ttl_ms=1)
     emit_local_video_windows(
         producer, str(source), str(out), duration_ms=3_000, window_ms=1_000,
-        sample_fps=1.0,
+        sample_fps=1.0, command_runner=_controlled_runner(),
     )
     events = bus.replay("local-window-job")
     frame_events = [event for event in events if event.type == "frame_kept"]
@@ -150,6 +232,7 @@ def test_local_media_windows_reconcile_overlapping_transcript_segments(tmp_path)
     emit_local_media_windows(
         producer, str(source), str(tmp_path / "frames"), duration_ms=2_000,
         window_ms=1_000, sample_fps=1.0, transcript_json=str(transcript),
+        command_runner=_controlled_runner(),
     )
     evidence = [event for event in bus.replay("media-window-job") if event.type != JOB_STARTED]
     assert [event.media_time_ms for event in evidence] == sorted(
@@ -174,14 +257,17 @@ def test_progressive_source_emits_each_real_window_once(tmp_path):
 
     first = emit_progressive_video_update(
         producer, cursor, str(source), str(out), playable_duration_ms=1_000,
+        command_runner=_controlled_runner(),
     )
     first_count = len(bus.replay("progressive-job"))
     second = emit_progressive_video_update(
         producer, cursor, str(source), str(out), playable_duration_ms=2_000,
+        command_runner=_controlled_runner(),
     )
     second_count = len(bus.replay("progressive-job"))
     final = emit_progressive_video_update(
         producer, cursor, str(source), str(out), playable_duration_ms=3_000, final=True,
+        command_runner=_controlled_runner(),
     )
     events = [event for event in bus.replay("progressive-job") if event.type != JOB_STARTED]
 
@@ -211,7 +297,7 @@ def test_real_multiscene_video_spans_three_source_windows(tmp_path):
     producer = WindowEventProducer(bus.event_sink("multiscene-job"), dedup_ttl_ms=1)
     emit_local_video_windows(
         producer, str(source), str(out), duration_ms=6_000, window_ms=2_000,
-        sample_fps=1.0,
+        sample_fps=1.0, command_runner=_controlled_runner(),
     )
     frames = [event for event in bus.replay("multiscene-job") if event.type == "frame_kept"]
     window_ids = {event.payload["artifact"].split("_")[1] for event in frames}
@@ -223,3 +309,14 @@ def test_real_multiscene_video_spans_three_source_windows(tmp_path):
 def _ffmpeg_available():
     from shutil import which
     return bool(which("ffmpeg"))
+
+
+def _controlled_runner():
+    return ProcessController().run
+
+
+def test_local_reader_requires_a_cancellation_aware_runner(tmp_path):
+    with pytest.raises(TypeError, match="command_runner"):
+        list(read_local_video_windows(
+            "source.mp4", str(tmp_path), duration_ms=1_000, window_ms=1_000,
+        ))

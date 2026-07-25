@@ -204,7 +204,19 @@ downloads:
 - `emit_local_media_windows(...)` processes a bounded local file window by
   window, while `ProgressiveWindowCursor` and
   `emit_progressive_video_update(...)` release only newly playable windows and
-  include the final partial window when the source completes.
+  include the final partial window when the source completes. Local readers
+  require a caller-owned cancellation-aware command runner (for example the
+  web job's `ProcessController.run`), so M2 never starts unmanaged ffmpeg work;
+- rolling state is hard-bounded by pending-entry/pending-byte, frame-signature
+  and transcript-idempotency limits. Overflow raises `WindowStateOverflow` and
+  fails the job deterministically instead of silently losing evidence;
+- `reset_epoch(start_ms)` discards pending/retry state for reconnects while
+  rejecting clock rewind. Reconnected sources must normalize timestamps onto
+  the existing absolute media clock. Evidence exactly at the watermark is
+  accepted, with equal timestamps retaining arrival order;
+- transcript retries may provide a stable `source_id`; without one, the exact
+  `(start_ms, end_ms, stripped_text)` tuple is the idempotency key, deliberately
+  avoiding fuzzy merging of legitimate repeated phrases.
 
 Status: implemented and covered by real ffmpeg E2E tests, including a
 three-scene video spanning three source windows and a progressively released

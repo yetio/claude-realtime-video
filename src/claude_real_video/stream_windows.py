@@ -17,6 +17,10 @@ import subprocess
 from typing import Any, Callable, Hashable, Iterable
 
 
+class WindowStateOverflow(RuntimeError):
+    """Raised when bounded rolling-window state reaches its hard limit."""
+
+
 @dataclass(frozen=True)
 class TimedEvidence:
     """One normalized item on a source-media clock."""
@@ -99,16 +103,40 @@ def segment_windows(duration_ms: int, *, window_ms: int) -> list[SourceWindow]:
 
 
 class SourceWatermark:
-    """Release ordered evidence once it is outside the lateness allowance."""
+    """Release ordered evidence once it is outside the lateness allowance.
 
-    def __init__(self, *, allowed_lateness_ms: int = 0) -> None:
+    The watermark is the earliest still-open source timestamp, so evidence at
+    exactly the watermark remains admissible. Equal timestamps retain arrival
+    order. Pending state is bounded; overflow fails the job instead of silently
+    dropping or reordering evidence.
+    """
+
+    def __init__(self, *, allowed_lateness_ms: int = 0,
+                 max_pending: int = 1_024,
+                 max_pending_bytes: int = 1024 * 1024) -> None:
         if allowed_lateness_ms < 0:
             raise ValueError("allowed_lateness_ms must be >= 0")
+        if max_pending <= 0:
+            raise ValueError("max_pending must be > 0")
+        if max_pending_bytes <= 0:
+            raise ValueError("max_pending_bytes must be > 0")
         self.allowed_lateness_ms = allowed_lateness_ms
+        self.max_pending = max_pending
+        self.max_pending_bytes = max_pending_bytes
         self.max_observed_ms: int | None = None
         self.watermark_ms: int | None = None
-        self._pending: list[TimedEvidence] = []
+        self._pending: list[tuple[TimedEvidence, int]] = []
+        self._pending_bytes = 0
         self._last_emitted_ms = -1
+        self._epoch_floor_ms = 0
+
+    @property
+    def pending_count(self) -> int:
+        return len(self._pending)
+
+    @property
+    def pending_bytes(self) -> int:
+        return self._pending_bytes
 
     def add(self, evidence: TimedEvidence) -> list[TimedEvidence]:
         """Accept evidence unless it is older than an emitted watermark.
@@ -119,9 +147,24 @@ class SourceWatermark:
         _validate_time(evidence.media_time_ms)
         if self.watermark_ms is not None and evidence.media_time_ms < self.watermark_ms:
             return []
-        self.max_observed_ms = max(self.max_observed_ms or 0, evidence.media_time_ms)
-        self.watermark_ms = self.max_observed_ms - self.allowed_lateness_ms
-        self._pending.append(evidence)
+        size = _evidence_size(evidence)
+        if size > self.max_pending_bytes:
+            raise WindowStateOverflow("one pending evidence item exceeds the byte limit")
+        next_max = max(self.max_observed_ms or 0, evidence.media_time_ms)
+        next_watermark = max(
+            self._epoch_floor_ms, next_max - self.allowed_lateness_ms,
+        )
+        remaining = [(item, item_size) for item, item_size in self._pending
+                     if item.media_time_ms > next_watermark]
+        if evidence.media_time_ms > next_watermark:
+            remaining.append((evidence, size))
+        remaining_bytes = sum(item_size for _item, item_size in remaining)
+        if len(remaining) > self.max_pending or remaining_bytes > self.max_pending_bytes:
+            raise WindowStateOverflow("pending evidence capacity exceeded")
+        self.max_observed_ms = next_max
+        self.watermark_ms = next_watermark
+        self._pending.append((evidence, size))
+        self._pending_bytes += size
         return self._drain_through(self.watermark_ms)
 
     def finish(self) -> list[TimedEvidence]:
@@ -130,12 +173,30 @@ class SourceWatermark:
             return []
         return self._drain_through(self.max_observed_ms)
 
+    def reset_epoch(self, epoch_start_ms: int) -> None:
+        """Discard pending evidence and open a new monotonic source epoch.
+
+        Callers must normalize a reconnected source onto the existing absolute
+        media clock. Clock rewind below the last emitted timestamp is rejected.
+        """
+        _validate_time(epoch_start_ms)
+        if epoch_start_ms < self._last_emitted_ms:
+            raise ValueError("source epoch cannot move behind emitted evidence")
+        self._pending.clear()
+        self._pending_bytes = 0
+        self.max_observed_ms = None
+        self._epoch_floor_ms = epoch_start_ms
+        self.watermark_ms = self._epoch_floor_ms
+
     def _drain_through(self, threshold_ms: int) -> list[TimedEvidence]:
-        ready = [item for item in self._pending if item.media_time_ms <= threshold_ms]
-        self._pending = [item for item in self._pending if item.media_time_ms > threshold_ms]
-        ready.sort(key=lambda item: item.media_time_ms)
+        ready = [(item, size) for item, size in self._pending
+                 if item.media_time_ms <= threshold_ms]
+        self._pending = [(item, size) for item, size in self._pending
+                         if item.media_time_ms > threshold_ms]
+        self._pending_bytes -= sum(size for _item, size in ready)
+        ready.sort(key=lambda row: row[0].media_time_ms)
         emitted: list[TimedEvidence] = []
-        for item in ready:
+        for item, _size in ready:
             if item.media_time_ms < self._last_emitted_ms:
                 continue
             emitted.append(item)
@@ -146,24 +207,41 @@ class SourceWatermark:
 class WindowDeduplicator:
     """Suppress repeated frame signatures across windows until their TTL ends."""
 
-    def __init__(self, *, ttl_ms: int) -> None:
+    def __init__(self, *, ttl_ms: int, max_signatures: int = 4_096) -> None:
         if ttl_ms <= 0:
             raise ValueError("ttl_ms must be > 0")
+        if max_signatures <= 0:
+            raise ValueError("max_signatures must be > 0")
         self.ttl_ms = ttl_ms
+        self.max_signatures = max_signatures
         self._last_kept_ms: dict[Hashable, int] = {}
+        self._max_seen_ms = -1
+
+    @property
+    def signature_count(self) -> int:
+        return len(self._last_kept_ms)
 
     def keep(self, signature: Hashable, media_time_ms: int) -> bool:
         _validate_time(media_time_ms)
+        if media_time_ms < self._max_seen_ms:
+            raise ValueError("dedup source time cannot move backwards")
+        self._max_seen_ms = media_time_ms
+        self._expire_at_or_before(media_time_ms - self.ttl_ms)
         previous = self._last_kept_ms.get(signature)
         if previous is not None and media_time_ms < previous + self.ttl_ms:
             return False
+        if previous is None and len(self._last_kept_ms) >= self.max_signatures:
+            raise WindowStateOverflow("frame signature capacity exceeded")
         self._last_kept_ms[signature] = media_time_ms
-        self._expire_before(media_time_ms - self.ttl_ms)
         return True
 
-    def _expire_before(self, threshold_ms: int) -> None:
+    def reset_epoch(self) -> None:
+        self._last_kept_ms.clear()
+        self._max_seen_ms = -1
+
+    def _expire_at_or_before(self, threshold_ms: int) -> None:
         for signature, kept_at in list(self._last_kept_ms.items()):
-            if kept_at < threshold_ms:
+            if kept_at <= threshold_ms:
                 del self._last_kept_ms[signature]
 
 
@@ -172,13 +250,21 @@ class TranscriptSegment:
     start_ms: int
     end_ms: int
     text: str
+    source_id: str | None = None
 
 
 class TranscriptReconciler:
-    """Merge overlapping segment reads without duplicating cross-window text."""
+    """Merge repeated segment reads using a stable source id when available."""
 
-    def __init__(self) -> None:
-        self._seen: set[tuple[int, int, str]] = set()
+    def __init__(self, *, max_keys: int = 4_096) -> None:
+        if max_keys <= 0:
+            raise ValueError("max_keys must be > 0")
+        self.max_keys = max_keys
+        self._seen: set[Hashable] = set()
+
+    @property
+    def key_count(self) -> int:
+        return len(self._seen)
 
     def reconcile(self, segments: list[TranscriptSegment]) -> list[TranscriptSegment]:
         unique: list[TranscriptSegment] = []
@@ -187,12 +273,22 @@ class TranscriptReconciler:
             _validate_time(segment.end_ms)
             if segment.end_ms < segment.start_ms:
                 raise ValueError("transcript segment end precedes start")
-            key = (segment.start_ms, segment.end_ms, segment.text.strip())
+            text = segment.text.strip()
+            source_id = (segment.source_id or "").strip() or None
+            key: Hashable = (("source_id", source_id) if source_id is not None else
+                             ("exact", segment.start_ms, segment.end_ms, text))
             if key in self._seen:
                 continue
+            if len(self._seen) >= self.max_keys:
+                raise WindowStateOverflow("transcript idempotency capacity exceeded")
             self._seen.add(key)
-            unique.append(TranscriptSegment(segment.start_ms, segment.end_ms, key[2]))
+            unique.append(TranscriptSegment(
+                segment.start_ms, segment.end_ms, text, source_id,
+            ))
         return sorted(unique, key=lambda segment: (segment.start_ms, segment.end_ms, segment.text))
+
+    def reset_epoch(self) -> None:
+        self._seen.clear()
 
 
 class SegmentRunner:
@@ -204,29 +300,82 @@ class SegmentRunner:
     regular ``frame_dropped`` event until their TTL expires.
     """
 
+    _FRAME_CANDIDATE = "_frame_candidate"
+    _TRANSCRIPT_CANDIDATE = "_transcript_candidate"
+
     def __init__(self, *, allowed_lateness_ms: int = 0,
-                 dedup_ttl_ms: int = 5_000) -> None:
-        self.clock = SourceWatermark(allowed_lateness_ms=allowed_lateness_ms)
-        self.dedup = WindowDeduplicator(ttl_ms=dedup_ttl_ms)
-        self.transcripts = TranscriptReconciler()
+                 dedup_ttl_ms: int = 5_000,
+                 max_pending: int = 1_024,
+                 max_pending_bytes: int = 1024 * 1024,
+                 max_signatures: int = 4_096,
+                 max_transcript_keys: int = 4_096) -> None:
+        self.clock = SourceWatermark(
+            allowed_lateness_ms=allowed_lateness_ms,
+            max_pending=max_pending,
+            max_pending_bytes=max_pending_bytes,
+        )
+        self.dedup = WindowDeduplicator(
+            ttl_ms=dedup_ttl_ms, max_signatures=max_signatures,
+        )
+        self.transcripts = TranscriptReconciler(max_keys=max_transcript_keys)
 
     def frame(self, signature: Hashable, media_time_ms: int,
               payload: dict[str, Any] | None = None) -> list[TimedEvidence]:
-        event_type = "frame_kept" if self.dedup.keep(signature, media_time_ms) else "frame_dropped"
-        return self.clock.add(TimedEvidence(media_time_ms, event_type, dict(payload or {})))
+        released = self.clock.add(TimedEvidence(media_time_ms, self._FRAME_CANDIDATE, {
+            "signature": signature,
+            "payload": dict(payload or {}),
+        }))
+        return self._release(released)
 
     def transcript(self, segment: TranscriptSegment) -> list[TimedEvidence]:
-        reconciled = self.transcripts.reconcile([segment])
-        if not reconciled:
-            return []
-        item = reconciled[0]
-        return self.clock.add(TimedEvidence(item.start_ms, "transcript_segment", {
-            "end_time_ms": item.end_ms,
-            "text": item.text,
+        _validate_time(segment.start_ms)
+        _validate_time(segment.end_ms)
+        if segment.end_ms < segment.start_ms:
+            raise ValueError("transcript segment end precedes start")
+        released = self.clock.add(TimedEvidence(segment.start_ms, self._TRANSCRIPT_CANDIDATE, {
+            "end_time_ms": segment.end_ms,
+            "text": segment.text,
+            "source_id": segment.source_id,
         }))
+        return self._release(released)
 
     def finish(self) -> list[TimedEvidence]:
-        return self.clock.finish()
+        return self._release(self.clock.finish())
+
+    def reset_epoch(self, epoch_start_ms: int) -> None:
+        """Reset retry/reconnect state without allowing the public clock to rewind."""
+        self.clock.reset_epoch(epoch_start_ms)
+        self.dedup.reset_epoch()
+        self.transcripts.reset_epoch()
+
+    def _release(self, evidence: list[TimedEvidence]) -> list[TimedEvidence]:
+        released: list[TimedEvidence] = []
+        for item in evidence:
+            if item.kind == self._FRAME_CANDIDATE:
+                event_type = ("frame_kept" if self.dedup.keep(
+                    item.payload["signature"], item.media_time_ms,
+                ) else "frame_dropped")
+                released.append(TimedEvidence(
+                    item.media_time_ms, event_type, dict(item.payload["payload"]),
+                ))
+                continue
+            if item.kind == self._TRANSCRIPT_CANDIDATE:
+                segments = self.transcripts.reconcile([TranscriptSegment(
+                    item.media_time_ms,
+                    item.payload["end_time_ms"],
+                    item.payload["text"],
+                    item.payload.get("source_id"),
+                )])
+                for segment in segments:
+                    released.append(TimedEvidence(
+                        segment.start_ms, "transcript_segment", {
+                            "end_time_ms": segment.end_ms,
+                            "text": segment.text,
+                        },
+                    ))
+                continue
+            released.append(item)
+        return released
 
 
 class WindowEventProducer:
@@ -240,11 +389,19 @@ class WindowEventProducer:
 
     def __init__(self, event_sink: Callable[[str, dict[str, Any]], None],
                  *, allowed_lateness_ms: int = 0,
-                 dedup_ttl_ms: int = 5_000) -> None:
+                 dedup_ttl_ms: int = 5_000,
+                 max_pending: int = 1_024,
+                 max_pending_bytes: int = 1024 * 1024,
+                 max_signatures: int = 4_096,
+                 max_transcript_keys: int = 4_096) -> None:
         self.event_sink = event_sink
         self.runner = SegmentRunner(
             allowed_lateness_ms=allowed_lateness_ms,
             dedup_ttl_ms=dedup_ttl_ms,
+            max_pending=max_pending,
+            max_pending_bytes=max_pending_bytes,
+            max_signatures=max_signatures,
+            max_transcript_keys=max_transcript_keys,
         )
 
     def frame(self, signature: Hashable, media_time_ms: int,
@@ -257,6 +414,9 @@ class WindowEventProducer:
     def finish(self) -> None:
         self._emit(self.runner.finish())
 
+    def reset_epoch(self, epoch_start_ms: int) -> None:
+        self.runner.reset_epoch(epoch_start_ms)
+
     def _emit(self, evidence: list[TimedEvidence]) -> None:
         for item in evidence:
             payload = dict(item.payload)
@@ -268,28 +428,27 @@ class WindowEventProducer:
 
 def read_local_video_windows(video: str, out_dir: str, *, duration_ms: int,
                              window_ms: int, sample_fps: float = 1.0,
-                             command_runner: Callable[[list[str]], subprocess.CompletedProcess[str]] | None = None
+                             command_runner: Callable[[list[str]], subprocess.CompletedProcess[str]]
                              ) -> Iterable[SegmentFrame]:
     """Extract timestamped frames from a bounded local source one window at a time.
 
     ``-ss`` makes ffmpeg's filter timestamps relative to the segment, so each
     parsed timestamp is offset by the window start before leaving this function.
-    The injectable runner lets callers reuse their cancellation-aware process
-    controller instead of starting an unmanaged child process.
+    The required runner must be owned by the caller's cancellation-aware
+    process controller; this module never starts an unmanaged child process.
     """
     if sample_fps <= 0 or not math.isfinite(sample_fps):
         raise ValueError("sample_fps must be finite and > 0")
-    runner = command_runner or _run_command
     root = Path(out_dir)
     root.mkdir(parents=True, exist_ok=True)
     for window in segment_windows(duration_ms, window_ms=window_ms):
-        yield from _read_local_video_window(video, root, window, sample_fps, runner)
+        yield from _read_local_video_window(video, root, window, sample_fps, command_runner)
 
 
 def emit_local_video_windows(producer: WindowEventProducer, video: str, out_dir: str,
                              *, duration_ms: int, window_ms: int,
                              sample_fps: float = 1.0,
-                             command_runner: Callable[[list[str]], subprocess.CompletedProcess[str]] | None = None
+                             command_runner: Callable[[list[str]], subprocess.CompletedProcess[str]]
                              ) -> None:
     """Read local source windows and publish their deduplicated M1 frame events."""
     emit_local_media_windows(
@@ -312,6 +471,7 @@ def read_transcript_json(path: str) -> list[TranscriptSegment]:
                 round(float(row["start"]) * 1000),
                 round(float(row["end"]) * 1000),
                 str(row.get("text") or "").strip(),
+                str(row.get("id") or row.get("source_id") or "").strip() or None,
             )
             _validate_time(segment.start_ms)
             _validate_time(segment.end_ms)
@@ -326,15 +486,16 @@ def emit_local_media_windows(producer: WindowEventProducer, video: str, out_dir:
                              *, duration_ms: int, window_ms: int,
                              sample_fps: float = 1.0,
                              transcript_json: str | None = None,
-                             command_runner: Callable[[list[str]], subprocess.CompletedProcess[str]] | None = None
+                             command_runner: Callable[[list[str]], subprocess.CompletedProcess[str]]
                              ) -> None:
     """Progressively merge real frame and transcript evidence window by window."""
     root = os.path.realpath(out_dir)
     Path(root).mkdir(parents=True, exist_ok=True)
-    runner = command_runner or _run_command
     transcripts = read_transcript_json(transcript_json) if transcript_json else []
     for window in segment_windows(duration_ms, window_ms=window_ms):
-        frames = list(_read_local_video_window(video, Path(root), window, sample_fps, runner))
+        frames = list(_read_local_video_window(
+            video, Path(root), window, sample_fps, command_runner,
+        ))
         window_transcripts = [segment for segment in transcripts
                               if segment.start_ms < window.end_ms and segment.end_ms > window.start_ms]
         _publish_window(producer, root, frames, window_transcripts)
@@ -346,16 +507,17 @@ def emit_progressive_video_update(producer: WindowEventProducer, cursor: Progres
                                   sample_fps: float = 1.0,
                                   transcript_json: str | None = None,
                                   final: bool = False,
-                                  command_runner: Callable[[list[str]], subprocess.CompletedProcess[str]] | None = None
+                                  command_runner: Callable[[list[str]], subprocess.CompletedProcess[str]]
                                   ) -> list[SourceWindow]:
     """Process only newly playable windows from a progressively growing source."""
     root = os.path.realpath(out_dir)
     Path(root).mkdir(parents=True, exist_ok=True)
-    runner = command_runner or _run_command
     transcripts = read_transcript_json(transcript_json) if transcript_json else []
     windows = cursor.observe(playable_duration_ms, final=final)
     for window in windows:
-        frames = list(_read_local_video_window(video, Path(root), window, sample_fps, runner))
+        frames = list(_read_local_video_window(
+            video, Path(root), window, sample_fps, command_runner,
+        ))
         window_transcripts = [segment for segment in transcripts
                               if segment.start_ms < window.end_ms and segment.end_ms > window.start_ms]
         _publish_window(producer, root, frames, window_transcripts)
@@ -408,10 +570,6 @@ def _read_local_video_window(video: str, root: Path, window: SourceWindow,
         yield SegmentFrame(window, media_time_ms, str(path))
 
 
-def _run_command(command: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(command, capture_output=True, text=True, errors="replace")
-
-
 def _showinfo_times(stderr: str) -> list[float]:
     return [max(0.0, float(value)) for value in re.findall(
         r"pts_time:\s*(-?[0-9]+(?:\.[0-9]+)?)", stderr or "",
@@ -421,3 +579,8 @@ def _showinfo_times(stderr: str) -> list[float]:
 def _validate_time(value: int) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0 or not math.isfinite(value):
         raise ValueError("media_time_ms must be a non-negative integer")
+
+
+def _evidence_size(evidence: TimedEvidence) -> int:
+    return (32 + len(evidence.kind.encode("utf-8")) +
+            len(repr(evidence.payload).encode("utf-8", errors="replace")))
