@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import json
 import math
 import os
 from pathlib import Path
@@ -239,26 +240,7 @@ def read_local_video_windows(video: str, out_dir: str, *, duration_ms: int,
     root = Path(out_dir)
     root.mkdir(parents=True, exist_ok=True)
     for window in segment_windows(duration_ms, window_ms=window_ms):
-        pattern = root / f"window_{window.index:05d}_%05d.jpg"
-        command = [
-            "ffmpeg", "-y", "-ss", f"{window.start_ms / 1000:.3f}",
-            "-t", f"{(window.end_ms - window.start_ms) / 1000:.3f}", "-i", video,
-            "-vf", f"fps={sample_fps},showinfo,scale=640:-1", "-vsync", "vfr",
-            str(pattern), "-hide_banner", "-loglevel", "info",
-        ]
-        result = runner(command)
-        if result.returncode != 0:
-            raise RuntimeError("ffmpeg failed while reading source window")
-        paths = sorted(root.glob(f"window_{window.index:05d}_*.jpg"))
-        local_times = _showinfo_times(result.stderr)
-        if len(local_times) != len(paths):
-            local_times = [index / sample_fps for index in range(len(paths))]
-        for path, local_seconds in zip(paths, local_times):
-            media_time_ms = min(
-                window.end_ms - 1,
-                window.start_ms + max(0, round(local_seconds * 1000)),
-            )
-            yield SegmentFrame(window, media_time_ms, str(path))
+        yield from _read_local_video_window(video, root, window, sample_fps, runner)
 
 
 def emit_local_video_windows(producer: WindowEventProducer, video: str, out_dir: str,
@@ -267,18 +249,91 @@ def emit_local_video_windows(producer: WindowEventProducer, video: str, out_dir:
                              command_runner: Callable[[list[str]], subprocess.CompletedProcess[str]] | None = None
                              ) -> None:
     """Read local source windows and publish their deduplicated M1 frame events."""
-    root = os.path.realpath(out_dir)
-    for frame in read_local_video_windows(
-        video, root, duration_ms=duration_ms, window_ms=window_ms,
+    emit_local_media_windows(
+        producer, video, out_dir, duration_ms=duration_ms, window_ms=window_ms,
         sample_fps=sample_fps, command_runner=command_runner,
-    ):
-        with open(frame.path, "rb") as image:
-            signature = hashlib.blake2b(image.read(), digest_size=16).digest()
-        producer.frame(signature, frame.media_time_ms, {
-            "artifact": os.path.relpath(frame.path, root).replace(os.sep, "/"),
-            "selection_reason": "window_sample",
-        })
+    )
+
+
+def read_transcript_json(path: str) -> list[TranscriptSegment]:
+    """Load the project's timestamped transcript format on the source clock."""
+    try:
+        with open(path, encoding="utf-8") as transcript_file:
+            rows = json.load(transcript_file).get("segments") or []
+    except (OSError, ValueError, TypeError, AttributeError):
+        return []
+    segments: list[TranscriptSegment] = []
+    for row in rows:
+        try:
+            segment = TranscriptSegment(
+                round(float(row["start"]) * 1000),
+                round(float(row["end"]) * 1000),
+                str(row.get("text") or "").strip(),
+            )
+            _validate_time(segment.start_ms)
+            _validate_time(segment.end_ms)
+            if segment.end_ms >= segment.start_ms and segment.text:
+                segments.append(segment)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+    return sorted(segments, key=lambda item: (item.start_ms, item.end_ms, item.text))
+
+
+def emit_local_media_windows(producer: WindowEventProducer, video: str, out_dir: str,
+                             *, duration_ms: int, window_ms: int,
+                             sample_fps: float = 1.0,
+                             transcript_json: str | None = None,
+                             command_runner: Callable[[list[str]], subprocess.CompletedProcess[str]] | None = None
+                             ) -> None:
+    """Progressively merge real frame and transcript evidence window by window."""
+    root = os.path.realpath(out_dir)
+    Path(root).mkdir(parents=True, exist_ok=True)
+    runner = command_runner or _run_command
+    transcripts = read_transcript_json(transcript_json) if transcript_json else []
+    for window in segment_windows(duration_ms, window_ms=window_ms):
+        frames = list(_read_local_video_window(video, Path(root), window, sample_fps, runner))
+        window_transcripts = [segment for segment in transcripts
+                              if segment.start_ms < window.end_ms and segment.end_ms > window.start_ms]
+        evidence = [(frame.media_time_ms, 0, "frame", frame) for frame in frames]
+        evidence.extend((segment.start_ms, 1, "transcript", segment)
+                        for segment in window_transcripts)
+        for _time, _order, kind, item in sorted(evidence, key=lambda row: (row[0], row[1])):
+            if kind == "transcript":
+                producer.transcript(item)
+                continue
+            with open(item.path, "rb") as image:
+                signature = hashlib.blake2b(image.read(), digest_size=16).digest()
+            producer.frame(signature, item.media_time_ms, {
+                "artifact": os.path.relpath(item.path, root).replace(os.sep, "/"),
+                "selection_reason": "window_sample",
+            })
     producer.finish()
+
+
+def _read_local_video_window(video: str, root: Path, window: SourceWindow,
+                             sample_fps: float,
+                             runner: Callable[[list[str]], subprocess.CompletedProcess[str]]
+                             ) -> Iterable[SegmentFrame]:
+    pattern = root / f"window_{window.index:05d}_%05d.jpg"
+    command = [
+        "ffmpeg", "-y", "-ss", f"{window.start_ms / 1000:.3f}",
+        "-t", f"{(window.end_ms - window.start_ms) / 1000:.3f}", "-i", video,
+        "-vf", f"fps={sample_fps},showinfo,scale=640:-1", "-vsync", "vfr",
+        str(pattern), "-hide_banner", "-loglevel", "info",
+    ]
+    result = runner(command)
+    if result.returncode != 0:
+        raise RuntimeError("ffmpeg failed while reading source window")
+    paths = sorted(root.glob(f"window_{window.index:05d}_*.jpg"))
+    local_times = _showinfo_times(result.stderr)
+    if len(local_times) != len(paths):
+        local_times = [index / sample_fps for index in range(len(paths))]
+    for path, local_seconds in zip(paths, local_times):
+        media_time_ms = min(
+            window.end_ms - 1,
+            window.start_ms + max(0, round(local_seconds * 1000)),
+        )
+        yield SegmentFrame(window, media_time_ms, str(path))
 
 
 def _run_command(command: list[str]) -> subprocess.CompletedProcess[str]:

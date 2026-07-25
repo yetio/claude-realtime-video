@@ -1,4 +1,5 @@
 """M2 source-clock and cross-window state regressions."""
+import json
 import subprocess
 import pytest
 
@@ -11,6 +12,7 @@ from claude_real_video.stream_windows import (
     TranscriptSegment,
     WindowDeduplicator,
     WindowEventProducer,
+    emit_local_media_windows,
     emit_local_video_windows,
     segment_windows,
 )
@@ -114,6 +116,33 @@ def test_local_segment_reader_emits_real_windowed_frames_to_m1_sink(tmp_path):
         event.media_time_ms for event in frame_events)
     assert all(0 <= event.media_time_ms < 3_000 for event in frame_events)
     assert all((out / event.payload["artifact"]).is_file() for event in frame_events)
+
+
+def test_local_media_windows_reconcile_overlapping_transcript_segments(tmp_path):
+    if not _ffmpeg_available():
+        pytest.skip("ffmpeg not installed")
+    source = tmp_path / "source.mp4"
+    subprocess.run([
+        "ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=duration=2:size=160x120:rate=10",
+        "-pix_fmt", "yuv420p", str(source),
+    ], check=True, capture_output=True)
+    transcript = tmp_path / "transcript.json"
+    transcript.write_text(json.dumps({"segments": [
+        {"start": 0.2, "end": 0.6, "text": "opening"},
+        {"start": 0.8, "end": 1.2, "text": "bridge"},
+    ]}), encoding="utf-8")
+    bus = JobEventBus(clock=lambda: 1.0)
+    bus.emit("media-window-job", JOB_STARTED)
+    producer = WindowEventProducer(bus.event_sink("media-window-job"), dedup_ttl_ms=1)
+    emit_local_media_windows(
+        producer, str(source), str(tmp_path / "frames"), duration_ms=2_000,
+        window_ms=1_000, sample_fps=1.0, transcript_json=str(transcript),
+    )
+    evidence = [event for event in bus.replay("media-window-job") if event.type != JOB_STARTED]
+    assert [event.media_time_ms for event in evidence] == sorted(
+        event.media_time_ms for event in evidence)
+    transcript_events = [event for event in evidence if event.type == "transcript_segment"]
+    assert [event.payload["text"] for event in transcript_events] == ["opening", "bridge"]
 
 
 def _ffmpeg_available():
