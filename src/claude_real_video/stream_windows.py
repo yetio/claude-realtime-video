@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Any, Hashable
+from typing import Any, Callable, Hashable
 
 
 @dataclass(frozen=True)
@@ -169,6 +169,43 @@ class SegmentRunner:
 
     def finish(self) -> list[TimedEvidence]:
         return self.clock.finish()
+
+
+class WindowEventProducer:
+    """Adapt a M2 ``SegmentRunner`` to the existing M1 ``event_sink`` API.
+
+    Local segment readers and the M3 RTSP sampler can call ``frame`` and
+    ``transcript`` as evidence arrives.  The adapter only emits the source-time
+    ordered items released by the watermark, so the existing JobEventBus/SSE
+    path remains the single public event transport.
+    """
+
+    def __init__(self, event_sink: Callable[[str, dict[str, Any]], None],
+                 *, allowed_lateness_ms: int = 0,
+                 dedup_ttl_ms: int = 5_000) -> None:
+        self.event_sink = event_sink
+        self.runner = SegmentRunner(
+            allowed_lateness_ms=allowed_lateness_ms,
+            dedup_ttl_ms=dedup_ttl_ms,
+        )
+
+    def frame(self, signature: Hashable, media_time_ms: int,
+              payload: dict[str, Any] | None = None) -> None:
+        self._emit(self.runner.frame(signature, media_time_ms, payload))
+
+    def transcript(self, segment: TranscriptSegment) -> None:
+        self._emit(self.runner.transcript(segment))
+
+    def finish(self) -> None:
+        self._emit(self.runner.finish())
+
+    def _emit(self, evidence: list[TimedEvidence]) -> None:
+        for item in evidence:
+            payload = dict(item.payload)
+            payload["timestamp_seconds"] = item.media_time_ms / 1000
+            if item.kind == "transcript_segment":
+                payload["end_seconds"] = payload.pop("end_time_ms") / 1000
+            self.event_sink(item.kind, payload)
 
 
 def _validate_time(value: int) -> None:

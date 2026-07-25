@@ -9,8 +9,10 @@ from claude_real_video.stream_windows import (
     TranscriptReconciler,
     TranscriptSegment,
     WindowDeduplicator,
+    WindowEventProducer,
     segment_windows,
 )
+from claude_real_video.job_events import JOB_STARTED, JobEventBus
 
 
 def test_watermark_releases_ordered_evidence_and_rejects_late_items():
@@ -66,3 +68,22 @@ def test_segment_runner_splits_source_and_emits_monotonic_cross_window_evidence(
     assert [event.kind for event in emitted] == [
         "transcript_segment", "frame_kept", "frame_dropped", "frame_kept",
     ]
+
+
+def test_window_event_producer_uses_the_existing_m1_event_sink_in_source_order():
+    bus = JobEventBus(clock=lambda: 1.0)
+    bus.emit("window-job", JOB_STARTED)
+    producer = WindowEventProducer(bus.event_sink("window-job"), allowed_lateness_ms=1_000,
+                                   dedup_ttl_ms=3_000)
+    producer.frame("scene-a", 1_000, {"artifact": "frames/a.jpg"})
+    producer.transcript(TranscriptSegment(500, 1_200, "opening"))
+    producer.frame("scene-a", 2_000, {"artifact": "frames/a-repeat.jpg"})
+    producer.frame("scene-b", 3_000, {"artifact": "frames/b.jpg"})
+    producer.finish()
+
+    events = bus.replay("window-job")
+    assert [event.type for event in events] == [
+        JOB_STARTED, "transcript_segment", "frame_kept", "frame_dropped", "frame_kept",
+    ]
+    assert [event.media_time_ms for event in events[1:]] == [500, 1_000, 2_000, 3_000]
+    assert events[1].payload == {"text": "opening", "end_time_ms": 1_200}
