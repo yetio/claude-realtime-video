@@ -316,6 +316,50 @@ def test_tiny_video_http_sse_e2e(manager, tmp_path):
         server.shutdown(); server.server_close()
 
 
+def test_rtsp_http_sse_route_never_echoes_source(manager, monkeypatch):
+    source = "rtsp://fixture:fixture-pass@camera/live?token=fixture-token"
+
+    def fake_rtsp_process(src, out_dir, *, event_sink, **_kwargs):
+        assert src == source
+        frames = os.path.join(out_dir, "frames")
+        os.makedirs(frames, exist_ok=True)
+        with open(os.path.join(frames, "rtsp_00000_00001.jpg"), "wb") as frame_file:
+            frame_file.write(b"jpeg")
+        event_sink(JOB_STARTED, {"source_kind": "rtsp"})
+        event_sink("stream_started", {"transport": "tcp", "attempt": 1})
+        event_sink("frame_kept", {
+            "artifact": "frames/rtsp_00000_00001.jpg",
+            "selection_reason": "rtsp_sample",
+            "timestamp_seconds": 0.1,
+        })
+        event_sink(JOB_DONE, {"frame_count": 1, "extracted_frames": 1})
+        return SimpleNamespace(frames_dir=frames, video="", frame_count=1)
+
+    monkeypatch.setattr(serve, "process", fake_rtsp_process)
+    monkeypatch.setattr(serve, "write_viewer", lambda *_args: "viewer.html")
+    server = _server()
+    try:
+        status, created = _post(server, "/run", {
+            "src": source,
+            "opts": {"grid": False, "transcribe": False},
+        })
+        assert status == 200
+        assert "fixture-pass" not in json.dumps(created)
+        status, _headers, body = _get(server, f"/events?id={created['id']}")
+        text = body.decode()
+        assert status == 200
+        assert "event: stream_started" in text
+        assert "event: frame_kept" in text
+        assert "event: job_done" in text
+        assert "fixture-pass" not in text
+        assert "fixture-token" not in text
+        payloads = [json.loads(line[6:]) for line in text.splitlines() if line.startswith("data: ")]
+        started = next(payload for payload in payloads if payload["type"] == JOB_STARTED)
+        assert started["payload"] == {"source_kind": "rtsp"}
+    finally:
+        server.shutdown(); server.server_close()
+
+
 def shutil_which(name):
     from shutil import which
     return which(name)
