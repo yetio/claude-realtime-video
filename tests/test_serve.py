@@ -318,6 +318,7 @@ def test_tiny_video_http_sse_e2e(manager, tmp_path):
 
 def test_rtsp_http_sse_route_never_echoes_source(manager, monkeypatch):
     source = "rtsp://fixture:fixture-pass@camera/live?token=fixture-token"
+    manager.retention_seconds = 60
 
     def fake_rtsp_process(src, out_dir, *, event_sink, **_kwargs):
         assert src == source
