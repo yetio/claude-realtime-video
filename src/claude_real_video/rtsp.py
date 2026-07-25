@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import hashlib
 import math
 import os
@@ -12,10 +12,17 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 from typing import Callable, Iterator
 from urllib.parse import SplitResult, urlsplit
 
-from .job_events import STREAM_DONE, STREAM_ERROR, STREAM_STARTED, STREAM_TIMEOUT
+from .job_events import (
+    STREAM_DONE,
+    STREAM_ERROR,
+    STREAM_RECONNECT,
+    STREAM_STARTED,
+    STREAM_TIMEOUT,
+)
 from .stream_windows import WindowEventProducer
 
 
@@ -35,6 +42,7 @@ class RtspLimits:
     """Hard limits for one bounded RTSP capture attempt."""
 
     max_runtime_seconds: float = 30.0
+    chunk_seconds: float = 5.0
     read_timeout_seconds: float = 5.0
     max_frames_per_minute: int = 60
     max_retained_frames: int = 120
@@ -43,6 +51,9 @@ class RtspLimits:
         if (not math.isfinite(self.max_runtime_seconds) or
                 not 0 < self.max_runtime_seconds <= 3_600):
             raise ValueError("max_runtime_seconds must be in (0, 3600]")
+        if (not math.isfinite(self.chunk_seconds) or
+                not 0 < self.chunk_seconds <= 60):
+            raise ValueError("chunk_seconds must be in (0, 60]")
         if (not math.isfinite(self.read_timeout_seconds) or
                 not 0 < self.read_timeout_seconds <= 300):
             raise ValueError("read_timeout_seconds must be in (0, 300]")
@@ -50,6 +61,21 @@ class RtspLimits:
             raise ValueError("max_frames_per_minute must be in [1, 3600]")
         if not 0 < self.max_retained_frames <= 10_000:
             raise ValueError("max_retained_frames must be in [1, 10000]")
+
+
+@dataclass(frozen=True)
+class RtspReconnectPolicy:
+    """Deterministic reconnect policy for retryable transport failures."""
+
+    max_reconnects: int = 2
+    backoff_seconds: float = 0.5
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.max_reconnects <= 10:
+            raise ValueError("max_reconnects must be in [0, 10]")
+        if (not math.isfinite(self.backoff_seconds) or
+                not 0 <= self.backoff_seconds <= 60):
+            raise ValueError("backoff_seconds must be in [0, 60]")
 
 
 @dataclass(frozen=True, repr=False)
@@ -111,8 +137,86 @@ def capture_rtsp_frames(producer: WindowEventProducer, source_url: str,
                         epoch_index: int = 0,
                         epoch_start_ms: int = 0) -> int:
     """Capture one bounded frame-only RTSP epoch and publish M1/M2 events."""
-    source = RtspSource.parse(source_url)
+    return _capture_rtsp_epoch(
+        producer, source_url, out_dir,
+        command_runner=command_runner,
+        transport=transport,
+        limits=limits or RtspLimits(),
+        epoch_index=epoch_index,
+        epoch_start_ms=epoch_start_ms,
+        emit_started=True,
+        emit_done=True,
+    )
+
+
+def stream_rtsp_frames(producer: WindowEventProducer, source_url: str,
+                       out_dir: str, *, command_runner: CommandRunner,
+                       transport: str = "tcp",
+                       limits: RtspLimits | None = None,
+                       reconnect: RtspReconnectPolicy | None = None,
+                       sleep: Callable[[float], None] = time.sleep) -> int:
+    """Process bounded RTSP chunks with finite retries and monotonic epochs."""
     limits = limits or RtspLimits()
+    reconnect = reconnect or RtspReconnectPolicy()
+    RtspSource.parse(source_url)
+    if transport not in {"tcp", "udp"}:
+        raise ValueError("RTSP transport must be tcp or udp")
+    producer.event_sink(STREAM_STARTED, {"transport": transport, "attempt": 1})
+
+    runtime_remaining = limits.max_runtime_seconds
+    frames_remaining = limits.max_retained_frames
+    epoch_index = 0
+    epoch_start_ms = 0
+    reconnects = 0
+    total_frames = 0
+    while runtime_remaining > 0 and frames_remaining > 0:
+        chunk_seconds = min(limits.chunk_seconds, runtime_remaining)
+        chunk_limits = replace(
+            limits,
+            max_runtime_seconds=chunk_seconds,
+            max_retained_frames=frames_remaining,
+        )
+        try:
+            captured = _capture_rtsp_epoch(
+                producer, source_url, out_dir,
+                command_runner=command_runner,
+                transport=transport,
+                limits=chunk_limits,
+                epoch_index=epoch_index,
+                epoch_start_ms=epoch_start_ms,
+                emit_started=False,
+                emit_done=False,
+            )
+        except RtspCaptureError as exc:
+            if exc.code not in _RETRYABLE_CODES or reconnects >= reconnect.max_reconnects:
+                raise
+            reconnects += 1
+            producer.event_sink(STREAM_RECONNECT, {
+                "attempt": reconnects + 1,
+                "code": exc.code,
+            })
+            producer.reset_epoch(epoch_start_ms)
+            if reconnect.backoff_seconds:
+                sleep(reconnect.backoff_seconds)
+            continue
+
+        total_frames += captured
+        frames_remaining -= captured
+        runtime_remaining -= chunk_seconds
+        epoch_start_ms += max(1, round(chunk_seconds * 1_000))
+        epoch_index += 1
+
+    producer.finish()
+    producer.event_sink(STREAM_DONE, {"frame_count": total_frames})
+    return total_frames
+
+
+def _capture_rtsp_epoch(producer: WindowEventProducer, source_url: str,
+                        out_dir: str, *, command_runner: CommandRunner,
+                        transport: str, limits: RtspLimits,
+                        epoch_index: int, epoch_start_ms: int,
+                        emit_started: bool, emit_done: bool) -> int:
+    source = RtspSource.parse(source_url)
     if transport not in {"tcp", "udp"}:
         raise ValueError("RTSP transport must be tcp or udp")
     if isinstance(epoch_index, bool) or not isinstance(epoch_index, int) or epoch_index < 0:
@@ -122,12 +226,15 @@ def capture_rtsp_frames(producer: WindowEventProducer, source_url: str,
 
     root = Path(out_dir)
     root.mkdir(parents=True, exist_ok=True)
+    for stale in root.glob(f"rtsp_{epoch_index:05d}_*.jpg"):
+        stale.unlink()
     pattern = root / f"rtsp_{epoch_index:05d}_%05d.jpg"
     sample_fps = limits.max_frames_per_minute / 60.0
-    producer.event_sink(STREAM_STARTED, {
-        "transport": transport,
-        "attempt": epoch_index + 1,
-    })
+    if emit_started:
+        producer.event_sink(STREAM_STARTED, {
+            "transport": transport,
+            "attempt": epoch_index + 1,
+        })
 
     with source.input_config(
         transport=transport,
@@ -137,6 +244,8 @@ def capture_rtsp_frames(producer: WindowEventProducer, source_url: str,
         result = command_runner(command)
 
     if result.returncode != 0:
+        for partial in root.glob(f"rtsp_{epoch_index:05d}_*.jpg"):
+            partial.unlink()
         code = _classify_failure(result.stderr)
         event_type = STREAM_TIMEOUT if code == "stream_timeout" else STREAM_ERROR
         producer.event_sink(event_type, {"code": code})
@@ -162,7 +271,8 @@ def capture_rtsp_frames(producer: WindowEventProducer, source_url: str,
             "selection_reason": "rtsp_sample",
         })
     producer.finish()
-    producer.event_sink(STREAM_DONE, {"frame_count": len(paths)})
+    if emit_done:
+        producer.event_sink(STREAM_DONE, {"frame_count": len(paths)})
     return len(paths)
 
 
@@ -212,3 +322,8 @@ def _redacted_endpoint(parts: SplitResult) -> str:
         host = f"[{host}]"
     port = f":{parts.port}" if parts.port is not None else ""
     return f"rtsp://{host}{port}/<redacted>"
+
+
+_RETRYABLE_CODES = frozenset({
+    "stream_timeout", "stream_unreachable", "stream_failed", "stream_no_frames",
+})

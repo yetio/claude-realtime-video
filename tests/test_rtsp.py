@@ -12,8 +12,10 @@ from claude_real_video.job_events import JOB_STARTED, JobEventBus
 from claude_real_video.rtsp import (
     RtspCaptureError,
     RtspLimits,
+    RtspReconnectPolicy,
     RtspSource,
     capture_rtsp_frames,
+    stream_rtsp_frames,
 )
 from claude_real_video.stream_windows import WindowEventProducer
 
@@ -134,9 +136,111 @@ def test_rtsp_contract_rejects_unsafe_sources_and_unbounded_limits():
     with pytest.raises(ValueError):
         RtspLimits(max_runtime_seconds=0)
     with pytest.raises(ValueError):
+        RtspLimits(chunk_seconds=0)
+    with pytest.raises(ValueError):
         RtspLimits(max_frames_per_minute=0)
     with pytest.raises(ValueError):
         RtspLimits(max_retained_frames=10_001)
+    with pytest.raises(ValueError):
+        RtspReconnectPolicy(max_reconnects=11)
+
+
+def test_rtsp_stream_reconnects_retryable_failure_and_resets_epoch(tmp_path):
+    source_url, username, password = _fixture_source()
+    calls = []
+    sleeps = []
+
+    def runner(command):
+        calls.append(list(command))
+        if len(calls) == 1:
+            return subprocess.CompletedProcess(command, 1, "", "Connection timed out")
+        pattern = next(value for value in command if "%05d.jpg" in value)
+        Path(pattern.replace("%05d", "00001")).write_bytes(b"reconnected-frame")
+        return subprocess.CompletedProcess(command, 0, "", "pts_time:0.100")
+
+    bus = JobEventBus(clock=lambda: 1.0)
+    bus.emit("rtsp-reconnect", JOB_STARTED, {"source_kind": "rtsp"})
+    producer = WindowEventProducer(bus.event_sink("rtsp-reconnect"), dedup_ttl_ms=5_000)
+    count = stream_rtsp_frames(
+        producer, source_url, str(tmp_path), command_runner=runner,
+        limits=RtspLimits(
+            max_runtime_seconds=1, chunk_seconds=1, read_timeout_seconds=1,
+            max_frames_per_minute=60, max_retained_frames=1,
+        ),
+        reconnect=RtspReconnectPolicy(max_reconnects=1, backoff_seconds=0.25),
+        sleep=sleeps.append,
+    )
+
+    assert count == 1
+    assert len(calls) == 2
+    assert sleeps == [0.25]
+    assert producer.runner.clock.watermark_ms == 100
+    events = bus.replay("rtsp-reconnect")
+    assert [event.type for event in events] == [
+        "job_started", "stream_started", "stream_timeout", "stream_reconnect",
+        "frame_kept", "stream_done",
+    ]
+    serialized = json.dumps([event.to_dict() for event in events])
+    assert username not in serialized
+    assert password not in serialized
+
+
+def test_rtsp_stream_does_not_retry_auth_or_unsupported_codec(tmp_path):
+    source_url, _username, _password = _fixture_source()
+    for stderr, expected in (
+        ("401 Unauthorized", "rtsp_auth_failed"),
+        ("Decoder not found", "unsupported_codec"),
+    ):
+        calls = []
+
+        def runner(command):
+            calls.append(command)
+            return subprocess.CompletedProcess(command, 1, "", stderr)
+
+        bus = JobEventBus(clock=lambda: 1.0)
+        bus.emit(expected, JOB_STARTED, {"source_kind": "rtsp"})
+        producer = WindowEventProducer(bus.event_sink(expected))
+        with pytest.raises(RtspCaptureError, match=f"^{expected}$"):
+            stream_rtsp_frames(
+                producer, source_url, str(tmp_path / expected),
+                command_runner=runner,
+                reconnect=RtspReconnectPolicy(max_reconnects=3, backoff_seconds=0),
+            )
+        assert len(calls) == 1
+        assert "stream_reconnect" not in [event.type for event in bus.replay(expected)]
+
+
+def test_static_rtsp_chunks_remain_bounded_and_deduplicated(tmp_path):
+    source_url, _username, _password = _fixture_source()
+    calls = []
+
+    def runner(command):
+        calls.append(command)
+        pattern = next(value for value in command if "%05d.jpg" in value)
+        Path(pattern.replace("%05d", "00001")).write_bytes(b"static-camera-frame")
+        return subprocess.CompletedProcess(command, 0, "", "pts_time:0.100")
+
+    bus = JobEventBus(clock=lambda: 1.0)
+    bus.emit("rtsp-static", JOB_STARTED, {"source_kind": "rtsp"})
+    producer = WindowEventProducer(bus.event_sink("rtsp-static"), dedup_ttl_ms=5_000)
+    count = stream_rtsp_frames(
+        producer, source_url, str(tmp_path), command_runner=runner,
+        limits=RtspLimits(
+            max_runtime_seconds=3, chunk_seconds=1, read_timeout_seconds=1,
+            max_frames_per_minute=60, max_retained_frames=3,
+        ),
+        reconnect=RtspReconnectPolicy(max_reconnects=0),
+    )
+
+    assert count == 3
+    assert len(calls) == 3
+    events = bus.replay("rtsp-static")
+    assert [event.type for event in events] == [
+        "job_started", "stream_started", "frame_kept", "frame_dropped", "stream_done",
+    ]
+    dropped = next(event for event in events if event.type == "frame_dropped")
+    assert dropped.payload["count"] == 2
+    assert len(list(tmp_path.glob("*.jpg"))) == 3
 
 
 def _fixture_source():
