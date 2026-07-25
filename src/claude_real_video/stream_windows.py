@@ -35,6 +35,49 @@ class SourceWindow:
     end_ms: int
 
 
+class ProgressiveWindowCursor:
+    """Track which complete source windows are newly playable as a file grows."""
+
+    def __init__(self, *, window_ms: int) -> None:
+        if window_ms <= 0:
+            raise ValueError("window_ms must be > 0")
+        self.window_ms = window_ms
+        self.next_start_ms = 0
+        self.next_index = 0
+        self.max_observed_ms = 0
+        self.finished = False
+
+    def observe(self, playable_duration_ms: int, *, final: bool = False) -> list[SourceWindow]:
+        """Return only windows not returned by an earlier observation.
+
+        Non-final observations release complete windows.  ``final=True`` also
+        releases the last partial window and seals the cursor.
+        """
+        _validate_time(playable_duration_ms)
+        if self.finished:
+            return []
+        if playable_duration_ms < self.max_observed_ms:
+            raise ValueError("playable duration cannot move backwards")
+        self.max_observed_ms = playable_duration_ms
+        limit = (playable_duration_ms if final else
+                 playable_duration_ms - playable_duration_ms % self.window_ms)
+        windows: list[SourceWindow] = []
+        while self.next_start_ms + self.window_ms <= limit:
+            end = self.next_start_ms + self.window_ms
+            windows.append(SourceWindow(self.next_index, self.next_start_ms, end))
+            self.next_index += 1
+            self.next_start_ms = end
+        if final and self.next_start_ms < playable_duration_ms:
+            windows.append(SourceWindow(
+                self.next_index, self.next_start_ms, playable_duration_ms,
+            ))
+            self.next_index += 1
+            self.next_start_ms = playable_duration_ms
+        if final:
+            self.finished = True
+        return windows
+
+
 @dataclass(frozen=True)
 class SegmentFrame:
     """A real frame extracted from one source window on the absolute clock."""
@@ -294,20 +337,49 @@ def emit_local_media_windows(producer: WindowEventProducer, video: str, out_dir:
         frames = list(_read_local_video_window(video, Path(root), window, sample_fps, runner))
         window_transcripts = [segment for segment in transcripts
                               if segment.start_ms < window.end_ms and segment.end_ms > window.start_ms]
-        evidence = [(frame.media_time_ms, 0, "frame", frame) for frame in frames]
-        evidence.extend((segment.start_ms, 1, "transcript", segment)
-                        for segment in window_transcripts)
-        for _time, _order, kind, item in sorted(evidence, key=lambda row: (row[0], row[1])):
-            if kind == "transcript":
-                producer.transcript(item)
-                continue
-            with open(item.path, "rb") as image:
-                signature = hashlib.blake2b(image.read(), digest_size=16).digest()
-            producer.frame(signature, item.media_time_ms, {
-                "artifact": os.path.relpath(item.path, root).replace(os.sep, "/"),
-                "selection_reason": "window_sample",
-            })
+        _publish_window(producer, root, frames, window_transcripts)
     producer.finish()
+
+
+def emit_progressive_video_update(producer: WindowEventProducer, cursor: ProgressiveWindowCursor,
+                                  video: str, out_dir: str, *, playable_duration_ms: int,
+                                  sample_fps: float = 1.0,
+                                  transcript_json: str | None = None,
+                                  final: bool = False,
+                                  command_runner: Callable[[list[str]], subprocess.CompletedProcess[str]] | None = None
+                                  ) -> list[SourceWindow]:
+    """Process only newly playable windows from a progressively growing source."""
+    root = os.path.realpath(out_dir)
+    Path(root).mkdir(parents=True, exist_ok=True)
+    runner = command_runner or _run_command
+    transcripts = read_transcript_json(transcript_json) if transcript_json else []
+    windows = cursor.observe(playable_duration_ms, final=final)
+    for window in windows:
+        frames = list(_read_local_video_window(video, Path(root), window, sample_fps, runner))
+        window_transcripts = [segment for segment in transcripts
+                              if segment.start_ms < window.end_ms and segment.end_ms > window.start_ms]
+        _publish_window(producer, root, frames, window_transcripts)
+    if final:
+        producer.finish()
+    return windows
+
+
+def _publish_window(producer: WindowEventProducer, root: str,
+                    frames: list[SegmentFrame],
+                    transcripts: list[TranscriptSegment]) -> None:
+    evidence = [(frame.media_time_ms, 0, "frame", frame) for frame in frames]
+    evidence.extend((segment.start_ms, 1, "transcript", segment)
+                    for segment in transcripts)
+    for _time, _order, kind, item in sorted(evidence, key=lambda row: (row[0], row[1])):
+        if kind == "transcript":
+            producer.transcript(item)
+            continue
+        with open(item.path, "rb") as image:
+            signature = hashlib.blake2b(image.read(), digest_size=16).digest()
+        producer.frame(signature, item.media_time_ms, {
+            "artifact": os.path.relpath(item.path, root).replace(os.sep, "/"),
+            "selection_reason": "window_sample",
+        })
 
 
 def _read_local_video_window(video: str, root: Path, window: SourceWindow,

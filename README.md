@@ -193,11 +193,22 @@ cleanup controls are in place.
 M2 turns the producer into a rolling analyzer for local files and progressive
 downloads:
 
-- source clock and watermark semantics;
-- cross-window timestamp normalization;
-- cross-window dedup with a TTL so repeated shots can return later without
+- `SegmentRunner` maintains source-clock watermark ordering and rejects late
+  evidence without corrupting the emitted timeline;
+- `WindowEventProducer` normalizes timestamps and publishes frame/transcript
+  evidence through the existing M1 event sink;
+- cross-window dedup uses a TTL so repeated shots can return later without
   flooding the viewer;
-- transcript segment reconciliation.
+- transcript reconciliation emits overlapping cross-window segments exactly
+  once;
+- `emit_local_media_windows(...)` processes a bounded local file window by
+  window, while `ProgressiveWindowCursor` and
+  `emit_progressive_video_update(...)` release only newly playable windows and
+  include the final partial window when the source completes.
+
+Status: implemented and covered by real ffmpeg E2E tests, including a
+three-scene video spanning three source windows and a progressively released
+source whose windows are emitted exactly once.
 
 ### M3 — RTSP live source intake
 

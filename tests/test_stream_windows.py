@@ -4,6 +4,7 @@ import subprocess
 import pytest
 
 from claude_real_video.stream_windows import (
+    ProgressiveWindowCursor,
     SegmentRunner,
     SourceWindow,
     SourceWatermark,
@@ -14,6 +15,7 @@ from claude_real_video.stream_windows import (
     WindowEventProducer,
     emit_local_media_windows,
     emit_local_video_windows,
+    emit_progressive_video_update,
     segment_windows,
 )
 from claude_real_video.job_events import JOB_STARTED, JobEventBus
@@ -53,6 +55,17 @@ def test_window_state_rejects_invalid_source_times():
         SourceWatermark().add(TimedEvidence(-1, "frame", {}))
     with pytest.raises(ValueError):
         WindowDeduplicator(ttl_ms=1).keep("x", True)
+
+
+def test_progressive_cursor_releases_complete_windows_once_and_final_partial():
+    cursor = ProgressiveWindowCursor(window_ms=1_000)
+    assert cursor.observe(999) == []
+    assert cursor.observe(1_500) == [SourceWindow(0, 0, 1_000)]
+    with pytest.raises(ValueError, match="cannot move backwards"):
+        cursor.observe(1_499)
+    assert cursor.observe(2_100) == [SourceWindow(1, 1_000, 2_000)]
+    assert cursor.observe(2_500, final=True) == [SourceWindow(2, 2_000, 2_500)]
+    assert cursor.observe(3_000) == []
 
 
 def test_segment_runner_splits_source_and_emits_monotonic_cross_window_evidence():
@@ -143,6 +156,68 @@ def test_local_media_windows_reconcile_overlapping_transcript_segments(tmp_path)
         event.media_time_ms for event in evidence)
     transcript_events = [event for event in evidence if event.type == "transcript_segment"]
     assert [event.payload["text"] for event in transcript_events] == ["opening", "bridge"]
+
+
+def test_progressive_source_emits_each_real_window_once(tmp_path):
+    if not _ffmpeg_available():
+        pytest.skip("ffmpeg not installed")
+    source = tmp_path / "source.mp4"
+    subprocess.run([
+        "ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=duration=3:size=160x120:rate=10",
+        "-pix_fmt", "yuv420p", str(source),
+    ], check=True, capture_output=True)
+    bus = JobEventBus(clock=lambda: 1.0)
+    bus.emit("progressive-job", JOB_STARTED)
+    producer = WindowEventProducer(bus.event_sink("progressive-job"), dedup_ttl_ms=1)
+    cursor = ProgressiveWindowCursor(window_ms=1_000)
+    out = tmp_path / "frames"
+
+    first = emit_progressive_video_update(
+        producer, cursor, str(source), str(out), playable_duration_ms=1_000,
+    )
+    first_count = len(bus.replay("progressive-job"))
+    second = emit_progressive_video_update(
+        producer, cursor, str(source), str(out), playable_duration_ms=2_000,
+    )
+    second_count = len(bus.replay("progressive-job"))
+    final = emit_progressive_video_update(
+        producer, cursor, str(source), str(out), playable_duration_ms=3_000, final=True,
+    )
+    events = [event for event in bus.replay("progressive-job") if event.type != JOB_STARTED]
+
+    assert first == [SourceWindow(0, 0, 1_000)]
+    assert second == [SourceWindow(1, 1_000, 2_000)]
+    assert final == [SourceWindow(2, 2_000, 3_000)]
+    assert first_count < second_count < len(events) + 1
+    assert [event.media_time_ms for event in events] == sorted(
+        event.media_time_ms for event in events)
+
+
+def test_real_multiscene_video_spans_three_source_windows(tmp_path):
+    if not _ffmpeg_available():
+        pytest.skip("ffmpeg not installed")
+    source = tmp_path / "multiscene.mp4"
+    subprocess.run([
+        "ffmpeg", "-y",
+        "-f", "lavfi", "-i", "testsrc=duration=2:size=160x120:rate=10",
+        "-f", "lavfi", "-i", "smptebars=duration=2:size=160x120:rate=10",
+        "-f", "lavfi", "-i", "rgbtestsrc=duration=2:size=160x120:rate=10",
+        "-filter_complex", "[0:v][1:v][2:v]concat=n=3:v=1[v]", "-map", "[v]",
+        "-pix_fmt", "yuv420p", str(source),
+    ], check=True, capture_output=True)
+    bus = JobEventBus(clock=lambda: 1.0)
+    bus.emit("multiscene-job", JOB_STARTED)
+    out = tmp_path / "frames"
+    producer = WindowEventProducer(bus.event_sink("multiscene-job"), dedup_ttl_ms=1)
+    emit_local_video_windows(
+        producer, str(source), str(out), duration_ms=6_000, window_ms=2_000,
+        sample_fps=1.0,
+    )
+    frames = [event for event in bus.replay("multiscene-job") if event.type == "frame_kept"]
+    window_ids = {event.payload["artifact"].split("_")[1] for event in frames}
+    assert window_ids == {"00000", "00001", "00002"}
+    assert [event.media_time_ms for event in frames] == sorted(
+        event.media_time_ms for event in frames)
 
 
 def _ffmpeg_available():
