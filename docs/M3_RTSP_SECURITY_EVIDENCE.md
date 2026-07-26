@@ -59,6 +59,9 @@ review. It does not claim release approval.
 - Retained frame ceiling: `rtsp_max_retained_frames` across the whole stream.
 - Reconnect ceiling: `rtsp_max_reconnects`; authentication and unsupported
   codec errors are non-retryable.
+- Reconnect backoff waits on the caller's `ProcessController.cancel_event`, so
+  web cancellation interrupts the wait instead of sleeping until the complete
+  backoff expires.
 - M1 still owns disk quota, subprocess cancellation, terminal arbitration,
   event replay bounds and cleanup.
 

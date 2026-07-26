@@ -4,11 +4,17 @@ import os
 from pathlib import Path
 import stat
 import subprocess
+import threading
 
 import pytest
 
 from claude_real_video.cli import _kb_source_label, _resolve_source
-from claude_real_video.core import ProcessingCancelled, process, save_to_kb
+from claude_real_video.core import (
+    ProcessController,
+    ProcessingCancelled,
+    process,
+    save_to_kb,
+)
 from claude_real_video.job_events import JOB_STARTED, JobEventBus
 from claude_real_video.rtsp import (
     RtspCaptureError,
@@ -16,6 +22,7 @@ from claude_real_video.rtsp import (
     RtspReconnectPolicy,
     RtspSource,
     capture_rtsp_frames,
+    process_rtsp,
     stream_rtsp_frames,
 )
 from claude_real_video.stream_windows import WindowEventProducer
@@ -226,6 +233,61 @@ def test_rtsp_retries_and_backoff_share_the_total_wall_clock_budget(tmp_path):
         "job_started", "stream_started", "stream_timeout", "stream_reconnect",
         "stream_timeout",
     ]
+
+
+def test_process_rtsp_cancel_interrupts_reconnect_backoff(tmp_path):
+    source_url, _username, _password = _fixture_source()
+    reconnect_started = threading.Event()
+    outcome = []
+
+    class FailingController(ProcessController):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def run(self, command):
+            self.calls += 1
+            return subprocess.CompletedProcess(
+                command, 1, "", "Connection timed out",
+            )
+
+    controller = FailingController()
+
+    def event_sink(event_type, _data):
+        if event_type == "stream_reconnect":
+            reconnect_started.set()
+
+    def worker():
+        try:
+            process_rtsp(
+                source_url,
+                str(tmp_path / "analysis"),
+                event_sink=event_sink,
+                process_controller=controller,
+                limits=RtspLimits(
+                    max_runtime_seconds=60,
+                    chunk_seconds=1,
+                    read_timeout_seconds=1,
+                    max_frames_per_minute=60,
+                    max_retained_frames=2,
+                ),
+                reconnect=RtspReconnectPolicy(
+                    max_reconnects=1,
+                    backoff_seconds=30,
+                ),
+            )
+        except ProcessingCancelled:
+            outcome.append("cancelled")
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    assert reconnect_started.wait(timeout=1), "RTSP retry did not enter backoff"
+    controller.cancel()
+    thread.join(timeout=1)
+
+    assert outcome == ["cancelled"]
+    assert controller.calls == 1
+    assert not thread.is_alive(), "cancel waited for the full reconnect backoff"
 
 
 def test_rtsp_stream_does_not_retry_auth_or_unsupported_codec(tmp_path):

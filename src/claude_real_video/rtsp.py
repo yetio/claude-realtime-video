@@ -272,6 +272,24 @@ def process_rtsp(source_url: str, out_dir: str, *,
     if cancel_check is not None and cancel_check():
         raise ProcessingCancelled("job cancelled")
     controller = process_controller or ProcessController()
+
+    def wait_for_backoff(seconds: float) -> None:
+        """Wait without making a web/controller cancellation sleep to expiry."""
+        cancel_event = getattr(controller, "cancel_event", None)
+        event_wait = getattr(cancel_event, "wait", None)
+        if callable(event_wait):
+            if event_wait(seconds):
+                raise ProcessingCancelled("job cancelled")
+            return
+        deadline = time.monotonic() + seconds
+        while True:
+            if cancel_check is not None and cancel_check():
+                raise ProcessingCancelled("job cancelled")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(0.05, remaining))
+
     producer = WindowEventProducer(safe_sink)
     extracted = stream_rtsp_frames(
         producer, source_url, frames_dir,
@@ -279,6 +297,7 @@ def process_rtsp(source_url: str, out_dir: str, *,
         transport=transport,
         limits=limits,
         reconnect=reconnect,
+        sleep=wait_for_backoff,
     )
     if cancel_check is not None and cancel_check():
         raise ProcessingCancelled("job cancelled")
