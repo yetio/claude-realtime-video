@@ -76,6 +76,51 @@ def test_sse_replay_and_gap_signal(manager):
         server.shutdown(); server.server_close()
 
 
+def test_sse_replays_terminal_appended_after_first_snapshot(manager, monkeypatch):
+    job = _started_job(manager)
+    original_wait = job.bus.wait_for_events
+    first_snapshot = True
+
+    def wait_for_events(job_id, *, since=0, timeout=None):
+        nonlocal first_snapshot
+        replay = original_wait(job_id, since=since, timeout=timeout)
+        if first_snapshot:
+            first_snapshot = False
+            manager.terminal(job, JOB_DONE, {"frame_count": 1})
+        return replay
+
+    monkeypatch.setattr(job.bus, "wait_for_events", wait_for_events)
+    server = _server()
+    try:
+        status, _headers, body = _get(server, f"/events?id={job.job_id}")
+        text = body.decode()
+        assert status == 200
+        assert text.index("event: job_started") < text.index("event: job_done")
+        assert text.count("event: job_done") == 1
+    finally:
+        server.shutdown(); server.server_close()
+
+
+def test_sse_last_event_id_can_replay_cleanup_only(manager):
+    job = _started_job(manager)
+    manager.terminal(job, JOB_DONE, {"frame_count": 1})
+    manager.cleanup(job)
+    server = _server()
+    try:
+        status, _headers, body = _get(
+            server,
+            f"/events?id={job.job_id}",
+            {"Last-Event-ID": "2"},
+        )
+        text = body.decode()
+        assert status == 200
+        assert "event: job_cleanup" in text
+        assert "event: job_done" not in text
+        assert "event: job_started" not in text
+    finally:
+        server.shutdown(); server.server_close()
+
+
 def test_sse_replay_gap_is_explicit(manager):
     job = _started_job(manager)
     for index in range(40):
