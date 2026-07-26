@@ -290,6 +290,46 @@ def test_process_rtsp_cancel_interrupts_reconnect_backoff(tmp_path):
     assert not thread.is_alive(), "cancel waited for the full reconnect backoff"
 
 
+def test_process_rtsp_cancel_check_interrupts_backoff_with_default_controller(
+    tmp_path, monkeypatch,
+):
+    source_url, _username, _password = _fixture_source()
+    capture_calls = []
+    cancel_checks = []
+
+    def fail_capture(_controller, command):
+        capture_calls.append(command)
+        return subprocess.CompletedProcess(
+            command, 1, "", "Connection timed out",
+        )
+
+    def cancel_check():
+        cancel_checks.append(True)
+        return len(cancel_checks) >= 2
+
+    monkeypatch.setattr(ProcessController, "run", fail_capture)
+    with pytest.raises(ProcessingCancelled, match="^job cancelled$"):
+        process_rtsp(
+            source_url,
+            str(tmp_path / "analysis"),
+            cancel_check=cancel_check,
+            limits=RtspLimits(
+                max_runtime_seconds=60,
+                chunk_seconds=1,
+                read_timeout_seconds=1,
+                max_frames_per_minute=60,
+                max_retained_frames=2,
+            ),
+            reconnect=RtspReconnectPolicy(
+                max_reconnects=1,
+                backoff_seconds=30,
+            ),
+        )
+
+    assert len(capture_calls) == 1
+    assert len(cancel_checks) == 2
+
+
 def test_rtsp_stream_does_not_retry_auth_or_unsupported_codec(tmp_path):
     source_url, _username, _password = _fixture_source()
     for stderr, expected in (

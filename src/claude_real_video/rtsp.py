@@ -277,10 +277,6 @@ def process_rtsp(source_url: str, out_dir: str, *,
         """Wait without making a web/controller cancellation sleep to expiry."""
         cancel_event = getattr(controller, "cancel_event", None)
         event_wait = getattr(cancel_event, "wait", None)
-        if callable(event_wait):
-            if event_wait(seconds):
-                raise ProcessingCancelled("job cancelled")
-            return
         deadline = time.monotonic() + seconds
         while True:
             if cancel_check is not None and cancel_check():
@@ -288,7 +284,12 @@ def process_rtsp(source_url: str, out_dir: str, *,
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return
-            time.sleep(min(0.05, remaining))
+            interval = min(0.05, remaining)
+            if callable(event_wait):
+                if event_wait(interval):
+                    raise ProcessingCancelled("job cancelled")
+            else:
+                time.sleep(interval)
 
     producer = WindowEventProducer(safe_sink)
     extracted = stream_rtsp_frames(
