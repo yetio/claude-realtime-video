@@ -102,6 +102,7 @@ def test_sse_replays_terminal_appended_after_first_snapshot(manager, monkeypatch
 
 
 def test_sse_last_event_id_can_replay_cleanup_only(manager):
+    manager.retention_seconds = 60
     job = _started_job(manager)
     manager.terminal(job, JOB_DONE, {"frame_count": 1})
     manager.cleanup(job)
@@ -334,6 +335,7 @@ def test_manager_bounds_ids_clients_retention_and_quota(tmp_path):
 
 
 def test_tiny_video_http_sse_e2e(manager, tmp_path):
+    manager.retention_seconds = 60
     if not shutil_which("ffmpeg"):
         pytest.skip("ffmpeg not installed")
     source = tmp_path / "tiny.mp4"
