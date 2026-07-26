@@ -27,5 +27,8 @@ installs ffmpeg on Ubuntu, macOS and Windows, sets `CRV_REQUIRE_FFMPEG=1`, runs
 the full suite. A missing dependency therefore fails the release gate instead
 of becoming a green skip. The server binds to `127.0.0.1`, accepts one
 connection, has no authentication surface, and is stopped in a `finally` path.
+Startup, request handling, RTP pacing, and shutdown consume one shared total
+deadline; expiry reports the specific fixture stage instead of relying on
+independent fixed sleeps or socket timeouts.
 Production credential handling remains covered separately by
 `docs/M3_RTSP_SECURITY_EVIDENCE.md` and `tests/test_rtsp.py`.

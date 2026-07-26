@@ -17,6 +17,16 @@ import pytest
 from claude_real_video.core import process
 
 
+_FIXTURE_DEADLINE_SECONDS = 45.0
+_POLL_INTERVAL_SECONDS = 0.05
+
+
+class RtspFixtureStageError(RuntimeError):
+    def __init__(self, stage: str, detail: str) -> None:
+        self.stage = stage
+        super().__init__(f"RTSP fixture failed during {stage}: {detail}")
+
+
 def test_local_rtsp_fixture_produces_real_frames(tmp_path):
     _require_ffmpeg()
     events = []
@@ -60,6 +70,19 @@ def test_release_gate_fails_when_required_ffmpeg_is_missing(monkeypatch):
         _require_ffmpeg()
 
 
+def test_rtsp_fixture_deadline_error_names_the_stage():
+    server = _RtspFixtureServer(b"\x47" * 188)
+    try:
+        server._deadline = time.monotonic() - 1
+        with pytest.raises(
+            RtspFixtureStageError,
+            match="RTSP fixture failed during RTSP handshake: total deadline exceeded",
+        ):
+            server._remaining("RTSP handshake")
+    finally:
+        server._listener.close()
+
+
 @contextmanager
 def local_rtsp_fixture(tmp_path: Path):
     transport_stream = tmp_path / "fixture.ts"
@@ -93,20 +116,22 @@ class _RtspFixtureServer:
         self._ready = threading.Event()
         self._thread = threading.Thread(target=self._serve, daemon=True)
         self._error: BaseException | None = None
+        self._deadline = time.monotonic() + _FIXTURE_DEADLINE_SECONDS
 
     def start(self) -> None:
         self._thread.start()
-        if not self._ready.wait(timeout=2):
-            raise RuntimeError("RTSP fixture did not start")
+        self._wait_for_event(self._ready, "server startup")
 
     def close(self) -> None:
         self._stop.set()
         self._listener.close()
-        self._thread.join(timeout=3)
-        if self._thread.is_alive():
-            raise RuntimeError("RTSP fixture did not stop")
+        while self._thread.is_alive():
+            remaining = self._remaining("server shutdown")
+            self._thread.join(timeout=min(_POLL_INTERVAL_SECONDS, remaining))
         if self._error is not None:
-            raise RuntimeError("RTSP fixture failed") from self._error
+            if isinstance(self._error, RtspFixtureStageError):
+                raise self._error
+            raise RtspFixtureStageError("server thread", type(self._error).__name__) from self._error
 
     def _serve(self) -> None:
         self._ready.set()
@@ -119,7 +144,6 @@ class _RtspFixtureServer:
                 except OSError:
                     return
                 with connection:
-                    connection.settimeout(3)
                     self._serve_connection(connection)
                 return
         except (BrokenPipeError, ConnectionResetError):
@@ -131,7 +155,12 @@ class _RtspFixtureServer:
         pending = b""
         while not self._stop.is_set():
             while b"\r\n\r\n" not in pending:
-                chunk = connection.recv(4096)
+                remaining = self._remaining("RTSP request")
+                connection.settimeout(min(_POLL_INTERVAL_SECONDS, remaining))
+                try:
+                    chunk = connection.recv(4096)
+                except socket.timeout:
+                    continue
                 if not chunk:
                     return
                 pending += chunk
@@ -210,11 +239,34 @@ class _RtspFixtureServer:
         sequence = 1
         timestamp = 0
         ssrc = 0x43525631
+        next_send = time.monotonic()
         for payload in payloads:
             if self._stop.is_set():
                 return
+            self._wait_until(next_send, "RTP stream")
             rtp = struct.pack("!BBHII", 0x80, 33, sequence, timestamp, ssrc) + payload
             connection.sendall(b"$\x00" + struct.pack("!H", len(rtp)) + rtp)
             sequence = (sequence + 1) & 0xFFFF
             timestamp = (timestamp + timestamp_step) & 0xFFFFFFFF
-            time.sleep(delay)
+            next_send += delay
+
+    def _wait_for_event(self, event: threading.Event, stage: str) -> None:
+        while not event.is_set():
+            remaining = self._remaining(stage)
+            event.wait(timeout=min(_POLL_INTERVAL_SECONDS, remaining))
+
+    def _wait_until(self, target: float, stage: str) -> None:
+        while not self._stop.is_set():
+            remaining_to_target = target - time.monotonic()
+            if remaining_to_target <= 0:
+                return
+            remaining = self._remaining(stage)
+            self._stop.wait(timeout=min(
+                _POLL_INTERVAL_SECONDS, remaining_to_target, remaining,
+            ))
+
+    def _remaining(self, stage: str) -> float:
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            raise RtspFixtureStageError(stage, "total deadline exceeded")
+        return remaining
