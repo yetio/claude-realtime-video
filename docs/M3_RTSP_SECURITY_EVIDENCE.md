@@ -104,3 +104,18 @@ public code: stream_timeout
 
 No real credential value should be added to this document, issue tracker,
 terminal transcript, CI log or review message.
+
+## Authenticated Device Positive Probe
+
+On 2026-07-26, a user-supplied authenticated RTSP source was tested through
+the public `process()` path with TCP transport, a six-second total budget,
+three-second chunks, a six-frame retention ceiling and one reconnect. The
+credential values were loaded from the local ignored `.env` file, combined in
+process memory and never placed in argv or test output.
+
+The capture produced three non-empty JPEG frames (38-75 KiB), and visual
+inspection confirmed a decodable camera image rather than a blank/corrupt
+artifact. `MANIFEST.txt` retained only `source: rtsp://<redacted>`.
+`MANIFEST.txt`, `frames.json` and printable JPEG metadata were scanned for the
+source authority, path and credential values with zero matches. The source
+address and credential values are intentionally omitted from this evidence.
