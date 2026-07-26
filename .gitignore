@@ -13,6 +13,7 @@ crv-out/
 .gstack/
 dist*/
 docs/M0_REALTIME_STREAMING_PLAN.md
+docs/M3_1_RTSP_PERCEPTUAL_DEDUP_PLAN.md
 
 # benchmark: evidence images are committed, working files are not
 !benchmark/results/**/*.jpg
